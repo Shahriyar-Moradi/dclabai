@@ -161,10 +161,6 @@
       <div class="panel-body"><div class="grid g2" id="home-und-fields"></div></div>
     </div>
 
-    <div class="panel" id="home-team" hidden data-f="home.team">
-      <div class="panel-head"><div class="panel-title"><h2>The team</h2><span class="sub">The understanding team walks this draft step by step, and stops only to ask you: a question, a confirmation, or leave to build.</span></div><button type="button" class="btn sm" id="home-team-go">Walk with the team</button></div>
-      <div class="panel-body"><div id="home-team-board" class="stack"></div></div>
-    </div>
 
     <div class="grid g-chat" id="home-lanes">
     <div class="panel" id="home-chat" hidden data-f="home.chat">
@@ -387,7 +383,6 @@ DC.view('home', {
       $('#home-solution', el).hidden = !on;
       $('#home-chat', el).hidden = !on;
       $('#home-understand', el).hidden = !on;
-      $('#home-team', el).hidden = !on;
       if (!on) { $('#home-twin', el).hidden = true; $('#home-lanes', el).className = 'stack'; }
     }
     const CHATS = ['open', 'built'];  // a built project's chat stays open: the person reads it and goes on
@@ -420,57 +415,6 @@ DC.view('home', {
       updateDataPill();
       drawUnderstanding(draft);
       loadTwin();
-      loadTeam();
-    }
-    // 28.8: the team's walk: its board and the pause it waits on, read without running; a step only when the person asks
-    async function loadTeam() {
-      const box = $('#home-team-board', el);
-      if (!S.draft) return;
-      try { drawTeam(await DC.client.teamBoard(S.draft.id, { quiet: true })); }
-      catch (e) { DC.states.failed(box, e, { lead: 'Could not read the team: ', retry: loadTeam }); }
-    }
-    function drawTeam(v) {
-      const box = $('#home-team-board', el);
-      const b = (v && v.board) || {}, wait = v && v.waiting;
-      if (!v || (!v.board && !wait)) { DC.states.empty(box, 'The team has not walked this draft yet.'); return; }
-      const fields = Object.entries(b.problem || {}).filter(([, x]) => x).map(([k, x]) => `<span class="tag">${esc(k)}: ${esc(x)}</span>`).join(' ');
-      const asks = !wait ? `<span class="muted small">${v.walk ? 'The walk ' + esc(v.walk.status || '') + '.' : 'Working.'}</span>`
-        : wait.kind === 'question'
-          ? `<div class="stack"><span>${esc(wait.text || '')}</span><span class="row"><label class="sr-only" for="home-team-answer">Your answer</label><input id="home-team-answer" type="text" placeholder="Your answer (or leave it empty to skip)"><button type="button" class="btn primary sm" id="home-team-answer-go">Answer</button></span></div>`
-          : `<div class="stack" data-team-kind="${esc(wait.kind || '')}" data-team-gate="${esc(wait.gate || '')}"><span>${esc(wait.kind === 'confirmation' ? 'Confirm the map of the problem?' : 'Approve: ' + (wait.gate || ''))}</span>${teamSummary(wait.summary)}<div class="row"><button type="button" class="btn primary sm" data-team-approve="1">Yes</button><button type="button" class="btn sm" data-team-approve="0">No</button></div></div>`;
-      const spent = Number(b.spent_eur || 0) > 0 ? ` · €${Number(b.spent_eur).toFixed(3)}` : '';
-      box.innerHTML = `<div class="row"><span class="pill outline">${esc(b.state || 'starting')}</span><span class="muted small">${v.node ? esc(v.node) + ' · ' + esc(v.what || '') + ' · ' : ''}${v.handoffs} steps${spent}</span></div>
-        <div class="row">${fields}</div>${(b.blockers || []).length ? `<div class="muted small">Blocked by: ${(b.blockers || []).map(esc).join(', ')}</div>` : ''}${asks}`;
-      const go = $('#home-team-answer-go', box);
-      if (go) go.onclick = () => teamStep({ answer: $('#home-team-answer', box).value });
-      box.querySelectorAll('[data-team-approve]').forEach(btn => {
-        const buildYes = wait && wait.kind === 'approval' && wait.gate === 'build' && btn.dataset.teamApprove === '1';
-        btn.onclick = () => buildYes ? teamBuild() : teamStep({ approve: btn.dataset.teamApprove === '1' });  // 28.8: Build starts the stages too
-      });
-    }
-    async function teamBuild() {
-      const box = $('#home-team-board', el);
-      DC.states.loading(box, { text: 'Building through the team…' });
-      try { await DC.client.buildAndRun(S.draft.id, { body: { team: true } }); const d = await DC.client.readDraft(S.draft.id, { quiet: true }); S.draft = d; openDraft(d); }
-      catch (e) { DC.states.failed(box, e, { lead: 'The team could not build: ', retry: loadTeam }); }
-    }
-    function teamSummary(sm) {  // what a confirmation or an approval is about: the critic's concerns, the map's parts, the build's state
-      if (!sm || typeof sm !== 'object') return '';
-      const line = (k, v) => `<li><span class="muted small">${esc(k)}:</span> ${Array.isArray(v) ? v.map(x => esc(typeof x === 'object' ? Object.values(x).join(' · ') : String(x))).join('; ') : esc(String(v))}</li>`;
-      return `<ul class="small">${Object.entries(sm).filter(([, v]) => v !== null && v !== undefined && v !== '').map(([k, v]) => line(k, v)).join('')}</ul>`;
-    }
-    async function teamStep(body) {
-      const box = $('#home-team-board', el);
-      if (!S.draft) return;
-      DC.states.loading(box, { text: 'The team is working…' });
-      try {
-        const out = await DC.client.teamWalk(S.draft.id, { body }); drawTeam(out.view);
-        if (out.project_id || (out.view && out.view.board && out.view.board.state === 'built')) {  // 28.8: the walk built: the page follows
-          const d = await DC.client.readDraft(S.draft.id, { quiet: true });
-          if (d.project_id) { S.draft = d; openDraft(d); }
-        }
-      }
-      catch (e) { DC.states.failed(box, e, { lead: 'The team could not go on: ', retry: loadTeam }); }
     }
     async function resume(id) {
       try { const d = await DC.client.readDraft(id, { quiet: true }); if (CHATS.includes(d.status)) { remember(d.id); openDraft(d); return true; } }
@@ -817,7 +761,9 @@ DC.view('home', {
       const proof = (c.proof || []).length ? `<div class="row small"><span class="pill proof">cites</span>${DC.chips(c.proof)}</div>` : '';
       const notes = (c.notes || []).map(n => `<div class="small muted">${esc(n)}</div>`).join('') + (c.note ? `<div class="small muted">${esc(c.note)}</div>` : '');
       const open = c.page && c.project ? `<button type="button" class="btn sm" data-open-project="${esc(c.project)}" data-open-view="${esc(c.page)}">Open ${esc(PAGES[c.page] || c.page)}</button>` : '';
-      return `<div class="inset stack tight project-card"><div class="row between"><div><div class="eyebrow">${esc(c.agent || '')}</div><b>${esc(c.title || '')}</b>${c.subtitle ? `<div class="small muted">${esc(c.subtitle)}</div>` : ''}</div>${open}</div>`
+      const href = c.download && c.project && DC.client.href[c.download.route];  // a route the API client knows, never a path from the card
+      const download = href ? `<a class="btn sm" href="${esc(href(c.project))}" download>${esc(c.download.label || 'Download')}</a>` : '';
+      return `<div class="inset stack tight project-card"><div class="row between"><div><div class="eyebrow">${esc(c.agent || '')}</div><b>${esc(c.title || '')}</b>${c.subtitle ? `<div class="small muted">${esc(c.subtitle)}</div>` : ''}</div>${open}${download}</div>`
         + facts + table + matrix + lines + proof + notes + (c.offer ? `<div class="small">${esc(c.offer)}</div>` : '') + '</div>';
     }
     function boardHtml(tasks) {
@@ -1256,7 +1202,6 @@ DC.view('home', {
       b.disabled = on; b.textContent = on ? 'Building…' : (S.draft && S.draft.project_id ? 'Open the project' : 'Build this chat as a project');
     }
     $('#home-create', el).addEventListener('click', build);
-    $('#home-team-go', el).addEventListener('click', () => teamStep({}));  // 28.8: start the walk (a walk already waiting answers with its pause)
     /* The header's "New project from chat" (a completely new project, never the old chat): the open
        conversation is put away (it stays in Projects and Needs you, to resume from there), the box is cleared and focused,
        and the page says what comes next */

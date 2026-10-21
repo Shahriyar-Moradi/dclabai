@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Optional
+
+try:
+    import fcntl  # the file lock across processes (macOS, Linux)
+except ImportError:  # Windows: the thread lock only
+    fcntl = None  # type: ignore[assignment]
 
 STAGE_KEYS = ("data", "leakage", "features", "models", "final")
 INDUSTRIES = (
@@ -47,6 +54,41 @@ def migrate(project: dict[str, Any]) -> bool:
             if "contract_hash" in entry:
                 entry.setdefault("solution_hash", entry.pop("contract_hash")); changed = True
     return changed
+
+
+_LOCKS: dict[str, "threading.RLock"] = {}
+_LOCKS_LOCK = threading.Lock()
+_HELD = threading.local()
+
+
+def _thread_lock(project_id: str) -> "threading.RLock":
+    with _LOCKS_LOCK:
+        return _LOCKS.setdefault(project_id, threading.RLock())
+
+
+@contextmanager
+def _project_lock(project_id: str, directory: Optional[Path] = None) -> Iterator[None]:
+    """One reader-writer of a project's document at a time: a thread lock, and (outermost only) an advisory file lock on
+    ``directory/.project.lock`` so a worker in another process waits too. Re-entrant within a thread."""
+    held = getattr(_HELD, "ids", None)
+    if held is None:
+        held = _HELD.ids = {}
+    with _thread_lock(project_id):
+        if held.get(project_id) or directory is None or fcntl is None or not directory.is_dir():
+            held[project_id] = held.get(project_id, 0) + 1
+            try:
+                yield
+            finally:
+                held[project_id] -= 1
+            return
+        with open(directory / ".project.lock", "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            held[project_id] = 1
+            try:
+                yield
+            finally:
+                held[project_id] = 0
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def new_project(project_id: str, name: str, industry: str = "general", goal: str = "") -> dict[str, Any]:
@@ -137,14 +179,24 @@ class ProjectStore:
         return project
 
     def save(self, project: dict[str, Any]) -> dict[str, Any]:
-        project["updated"] = now()
-        _write_atomic(self.directory(project["id"]) / "project.json", json.dumps(project, indent=2, ensure_ascii=False))
+        from ..storage.notes import into
+
+        path = self.directory(project["id"]) / "project.json"
+        with _project_lock(project["id"], self.directory(project["id"])):
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+            except (OSError, json.JSONDecodeError):
+                stored = None
+            into(project, stored)  # a note written while this document was out is kept (storage/notes.py)
+            project["updated"] = now()
+            _write_atomic(path, json.dumps(project, indent=2, ensure_ascii=False))
         return project
 
     def update(self, project_id: str, **values: Any) -> dict[str, Any]:
-        project = self.get(project_id)
-        project.update(values)
-        return self.save(project)
+        with _project_lock(project_id, self.directory(project_id)):  # one read and write at a time per project, across processes too
+            project = self.get(project_id)
+            project.update(values)  # memory merges in save: notes are added to what is stored
+            return self.save(project)
 
     def list(self, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
         projects = []

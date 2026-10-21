@@ -3,6 +3,7 @@
   'use strict';
   const DEMO = window.DEMO || {};
   const FEATURES = window.FEATURES || [];
+  let TOUR_DONE = 'Tour finished.';
   const RECORDS = window.DEMO_RECORDS || [];
   const REC = Object.fromEntries(RECORDS.map(r => [r.id, r]));
 
@@ -95,13 +96,9 @@
     intern: { label: 'Intern', crumbs: ['Workspace'] },
     compute: { label: 'Compute & jobs', crumbs: ['Workspace'] },
     evidence: { label: 'Evidence library', crumbs: ['Knowledge'] },
-    lab: { label: 'Research lab', crumbs: ['Knowledge'] },
-    benchmark: { label: 'Judgment benchmark', crumbs: ['Knowledge'] },
-    policy: { label: 'Policy model', crumbs: ['Knowledge'] },
     packs: { label: 'Domain packs', crumbs: ['Platform'] },
     integrations: { label: 'Integrations', crumbs: ['Platform'] },
     admin: { label: 'Admin', crumbs: ['Platform'] },
-    blueprint: { label: 'Blueprint & roadmap', crumbs: ['Platform'] },
   };
   const NAV = [
     { group: 'Workspace', items: [
@@ -725,7 +722,6 @@
       items.push({ group: 'Sections', label: `${m.label} › ${p.dataset.label || p.dataset.pane}`, hint: (m.crumbs || []).join(' / '), run: () => { location.hash = v + '/' + p.dataset.pane; } });
     });
     items.push({ group: 'Actions', label: 'Start a new project', hint: 'N', run: () => { location.hash = 'new'; } });
-    items.push({ group: 'Actions', label: state.bp ? 'Hide the blueprint layer' : 'Show the blueprint layer', hint: 'B', run: () => setBlueprint(!state.bp) });
     items.push({ group: 'Actions', label: 'View as business', hint: 'role', run: () => setRole('business') });
     items.push({ group: 'Actions', label: 'View as developer', hint: 'role', run: () => setRole('developer') });
     Object.entries(TOURS).forEach(([k, t]) => items.push({ group: 'Tours', label: 'Start the ' + t.name.toLowerCase(), hint: t.steps.length + ' steps', run: () => startTour(k) }));
@@ -1209,7 +1205,6 @@
     $('#drawer-close').addEventListener('click', drawer.close);
     $('#modal-cancel').addEventListener('click', modal.close);
     $('#modal-confirm').addEventListener('click', () => { const fn = modalConfirm; if (fn && fn($('#modal')) === false) return; modal.close(); });
-    $('#bp-switch').addEventListener('change', e => setBlueprint(e.target.checked));
     $('#bp-close').addEventListener('click', () => setBlueprint(false));
     $('#bp-expand').addEventListener('click', () => { const p = $('#bp-panel'); const min = p.classList.toggle('min'); $('#bp-expand').textContent = min ? 'Show list' : 'Hide list'; $('#bp-expand').setAttribute('aria-expanded', String(!min)); renderBpPanel(); });
     $('#role-select').addEventListener('change', e => setRole(e.target.value));
@@ -1227,7 +1222,7 @@
         html: `<p>Each tour opens the pages in order and points at the part that matters. Use the bar at the bottom to move.</p><div class="stack tight">${Object.entries(TOURS).map(([k, t]) => `<button type="button" class="list-item panel" data-tour-start="${k}" data-style="border-radius:10px"><div class="li-main"><span class="li-title">${esc(t.name)}</span><span class="li-sub">${esc(t.blurb)}</span></div><span class="pill outline">${t.steps.length} steps</span></button>`).join('')}</div>`,
       });
     });
-    $('#tb-next').addEventListener('click', () => { const t = TOURS[state.tour]; if (!t) return; if (state.step < t.steps.length - 1) { state.step++; gotoStep(); } else { endTour(); toast('Tour finished. Turn on the blueprint layer to see what exists today.'); } });
+    $('#tb-next').addEventListener('click', () => { const t = TOURS[state.tour]; if (!t) return; if (state.step < t.steps.length - 1) { state.step++; gotoStep(); } else { endTour(); toast(TOUR_DONE); } });
     $('#tb-back').addEventListener('click', () => { if (state.step > 0) { state.step--; gotoStep(); } });
     $('#tb-exit').addEventListener('click', endTour);
     document.addEventListener('click', e => { if (e.target.closest('[data-tour-start]')) modal.close(); }, true);
@@ -1243,7 +1238,6 @@
     projectSwitch.wire();
     const h0 = parseHash();
     show(h0.view, h0.pane);
-    if (bpOn) setBlueprint(true);
     loadRecords();
   }
 
