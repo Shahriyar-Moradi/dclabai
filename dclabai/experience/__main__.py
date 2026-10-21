@@ -1,0 +1,234 @@
+"""Find a session in the workspace's record (19.2, 19.4; the Admin page's Sessions tab reads the same).
+
+    python -m dclabai.experience sessions [--limit 20]           the latest visits: who, when, the problem, how it ended
+    python -m dclabai.experience show VISIT                      one visit's timeline, as it happened
+    python -m dclabai.experience show --project PROJECT_ID       everything that happened to a project
+    python -m dclabai.experience show --draft DRAFT_ID           a Home conversation, from its first sentence
+                                                                   (a table's values never; --model-text adds prompts)
+    python -m dclabai.experience search --kind refused           events and their visits: --kind (a kind, a family,
+                                                                   refused, errors), --project, --draft, --person,
+                                                                   --text, --code, --since, --until (until excluded)
+    python -m dclabai.experience lineage PROJECT [--path P]      each stage's run, or where a report's number comes from
+    python -m dclabai.experience replay PROJECT STAGE            rerun a stage from its record (a scratch copy) and compare
+
+The workspace is DCLAB_AGENT_HOME's (the server's own), on PostgreSQL when DCLAB_DATABASE_URL is set.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from . import contract, finder, lines, open_log, sessions
+
+
+def _log():
+    from ..settings import Settings
+    from ..storage import db
+
+    home = Path(Settings.load().agent_home)
+    workspace = db.workspace_for(home) if db.database_url(required=False) else None
+    return open_log(home, workspace)
+
+
+def _projects():
+    from ..settings import Settings
+    from ..storage import open_stores
+
+    return open_stores(Path(Settings.load().agent_home))[0]
+
+
+def _lineage(args, parser) -> int:
+    """19.5: a run's lineage, from the project's stage records; a replay in a scratch copy."""
+    from ..studio import lineage
+
+    store = _projects()
+    try:
+        if args.command == "replay":
+            with _workspace_log():
+                out = lineage.replay(store, args.project, args.stage)
+        else:
+            out = lineage.trace(store, args.project, args.path) if args.path else lineage.runs(store, args.project)
+    except (KeyError, ValueError) as exc:  # an unknown project, stage or path; a table that changed on disk (DataError)
+        parser.error(str(exc.args[0]) if exc.args else "not found")
+    print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
+    reproduced = all(out.get(k) for k in ("replayed", "same_inputs", "same_value", "same_numbers")) and out.get("same_steps") is not False  # 23.8
+    return 0 if args.command != "replay" or reproduced else 1
+
+
+def _workspace_log():
+    """The workspace's record installed for this process, so the replay's one run.recorded event is kept."""
+    import contextlib
+
+    from . import install
+
+    @contextlib.contextmanager
+    def installed():
+        install(_log())
+        try:
+            yield
+        finally:
+            install(None)
+    return installed()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m dclabai.experience", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    listing = sub.add_parser("sessions")
+    listing.add_argument("--limit", type=int, default=20)
+    listing.add_argument("--json", action="store_true")
+    show = sub.add_parser("show")
+    show.add_argument("visit", nargs="?")
+    show.add_argument("--project")
+    show.add_argument("--draft")
+    show.add_argument("--json", action="store_true")
+    show.add_argument("--model-text", action="store_true", help="also the prompts and replies the workspace kept")
+    grouped = sub.add_parser("errors", help="23.4: the last days' errors grouped by fingerprint")
+    grouped.add_argument("--days", type=int, default=30)
+    grouped.add_argument("--json", action="store_true")
+    find = sub.add_parser("search")
+    for name in ("kind", "project", "draft", "person", "text", "code", "since", "until", "request", "trace"):
+        find.add_argument(f"--{name}")
+    find.add_argument("--limit", type=int, default=50)
+    find.add_argument("--json", action="store_true")
+    trace = sub.add_parser("lineage")
+    trace.add_argument("project")
+    trace.add_argument("--path", help="a report's record path, e.g. final.evidence.holdout_metrics.roc_auc")
+    again = sub.add_parser("replay")
+    again.add_argument("project")
+    again.add_argument("stage")
+    asked = sub.add_parser("query", help="23.9: a standard question of the record (see dclabai/experience/queries.py)")
+    asked.add_argument("name")
+    for arg in ("request", "project", "draft", "visit"):
+        asked.add_argument(f"--{arg}")
+    asked.add_argument("--days", type=int)
+    asked.add_argument("--json", action="store_true")
+    listed = sub.add_parser("catalog", help="every dataset make datasets built (19.13), or one set's sessions")
+    listed.add_argument("--lineage", metavar="BUILDER/NAME", help="the sessions one dataset came from")
+    listed.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command in ("lineage", "replay"):
+        return _lineage(args, parser)
+    from ..storage import db
+
+    if db.database_url(required=False):  # the record lives in the database: say plainly when it cannot be read yet
+        problem = db.reachable()
+        if problem:
+            print(f"The database did not answer ({problem}). Is PostgreSQL running? `make dev` checks it.", file=sys.stderr)
+            return 2
+        at, newest = db.current(), db.head()
+        if at != newest:
+            print(f"The database's schema is at {at or 'nothing'}; the record needs {newest}. Run `make dev` once (it migrates), "
+                  "or: .venv/bin/python -m dclabai.storage upgrade", file=sys.stderr)
+            return 2
+    log = _log()
+    if args.command == "catalog":
+        from ..ledger import open_ledger
+        from ..settings import Settings
+        from . import catalog as cat
+
+        home = Path(Settings.load().agent_home)
+        if args.lineage:
+            try:
+                found = cat.lineage(home, args.lineage, log, open_ledger(home, getattr(log, "workspace", None)))
+            except KeyError:
+                parser.error(f"no readable dataset {args.lineage}: `python -m dclabai.experience catalog` lists them")
+            if args.json:
+                print(json.dumps(found, indent=2, ensure_ascii=False))
+                return 0
+            print(f"{found['path']}: {len(found['sessions'])} sessions; sources {found['sources']}")
+            for s in found["sessions"]:
+                print(f"  {s['visit']}  {s['events']} events")
+            return 0
+        items = cat.catalog(home)
+        print(json.dumps(items, indent=2, ensure_ascii=False) if args.json else "\n".join(cat.lines(items)) or "No datasets yet: make datasets")
+        return 0
+    if args.command == "query":
+        from ..ledger import open_ledger
+        from ..settings import Settings
+        from . import queries
+
+        home = Path(Settings.load().agent_home)
+        try:
+            from ..models import open_usage
+
+            answer = queries.run(args.name, log, open_ledger(home, getattr(log, "workspace", None)), request=args.request, project=args.project,
+                                 draft=args.draft, visit=args.visit, days=args.days, usage=open_usage(home))
+        except (ValueError, TypeError) as exc:
+            parser.error(str(exc))
+        if args.json:
+            print(json.dumps(answer, indent=2, ensure_ascii=False, default=str))
+            return 0
+        print(answer["title"])
+        for row in answer["rows"]:
+            print("  " + "  |  ".join("" if cell is None else str(cell) for cell in row))
+        if not answer["rows"]:
+            print("  (nothing)")
+        return 0
+    if args.command == "errors":
+        from .finder import errors as grouped_errors
+
+        groups = grouped_errors(log, args.days)
+        if args.json:
+            print(json.dumps(groups, indent=2, ensure_ascii=False))
+            return 0
+        for g in groups:
+            print(f"{g['fingerprint']:<24} {g['count']:>5}  {', '.join(g['codes']) or '?'}  {g['frame'] or ''}  {', '.join(g['where'])[:60]}  last {g['last'][:16]}"
+                  + (f"  requests {', '.join(g['requests'])}" if g["requests"] else ""))
+        if not groups:
+            print(f"no errors in the last {args.days} days")
+        return 0
+    if args.command == "sessions":
+        from . import flags, visit_events
+
+        visits = log.visits(args.limit)
+        events = visit_events(log, visits)
+        cards = [(contract.session_card(events[v]), flags(events[v])) for v in visits if events.get(v)]
+        if args.json:
+            print(json.dumps([{**json.loads(c.model_dump_json()), "flags": [f.model_dump() for f in found]} for c, found in cards], indent=2, ensure_ascii=False))
+            return 0
+        for c, found in cards:
+            cost = ", ".join(f"{v:.4f} {k}" for k, v in c.cost.items()) or "no model spend"
+            print(f"{c.visit}  {c.started[:16]} → {c.ended[11:16]}  {c.outcome:<8} {c.events:>4} events  refused {c.refused}  errors {c.errors}  {cost}")
+            if c.problem:
+                print(f"    {c.problem[:110]}")
+            for f in found:  # 19.9: what the failure detectors found
+                print(f"    ! {f.detector} ({f.severity}): {f.message}")
+        return 0
+    if args.command == "search":
+        query = {k: getattr(args, k) for k in ("kind", "project", "draft", "person", "text", "code", "since", "until", "request", "trace")}
+        if not any(query.values()):
+            parser.error("name at least one of --kind, --project, --draft, --person, --text, --code, --since, --until, --request, --trace")
+        try:
+            found = finder.search(log, **query, limit=args.limit)
+        except ValueError as exc:  # an unknown kind, a date that is not one
+            parser.error(str(exc))
+        if args.json:
+            print(json.dumps({**found, "events": [finder.view(e) for e in found["events"]],
+                              "sessions": [json.loads(c.model_dump_json()) for c in found["sessions"]]}, indent=2, ensure_ascii=False))
+            return 0
+        more = f" (read the newest {found['scanned']} events only)" if found["capped"] else ""
+        print(f"{found['total']} matching events in {found['visits']} sessions{more}")
+        for c in found["sessions"]:
+            print(f"{c.visit}  {c.started[:16]}  {c.outcome:<8} refused {c.refused}  errors {c.errors}  {(c.problem or '')[:80]}")
+        print()
+        shown = [contract.redact(e, finder.SHOWN) for e in reversed(found["events"])]  # what the page shows: no values, no prompts
+        print("\n".join(lines(shown)) or "No events.")
+        return 0
+    if not (args.visit or args.project or args.draft):
+        parser.error("name a visit, --project or --draft")
+    events = log.read(visit=args.visit, project=args.project, conversation=args.draft)
+    allowed = finder.SHOWN + (("model_text",) if args.model_text else ())  # a table's values never; prompts on request
+    events = [contract.redact(e, allowed) for e in events]
+    if args.json:
+        print(json.dumps([json.loads(e.model_dump_json()) for e in events], indent=2, ensure_ascii=False))
+    else:
+        print("\n".join(lines(events)) or "No events.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,360 @@
+"""The product's PostgreSQL schema (package 9.2).
+
+A document that is always read whole (a project, a stage record, a draft, an intern session) is one JSONB column.
+What a list filters, sorts or joins on is a real column, with an index. The three append-only logs (activity,
+transition, draft_event) are rows that are only ever inserted.
+
+Everything belongs to a workspace. Until accounts exist (package 10.2) the product runs in one workspace per
+workspace folder (``DCLAB_AGENT_HOME``); the users and memberships tables are here so that step adds no table.
+``migrations/versions`` holds the changes; ``tests/test_storage_postgres.py`` fails when they and this file disagree.
+"""
+
+from __future__ import annotations
+
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
+
+metadata = sa.MetaData(naming_convention={
+    "ix": "ix_%(table_name)s_%(column_0_N_name)s", "pk": "pk_%(table_name)s", "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_N_name)s_%(referred_table_name)s", "ck": "ck_%(table_name)s_%(constraint_name)s"})
+
+TIME = sa.DateTime(timezone=True)
+NOW = sa.text("now()")
+
+
+def _id(name: str = "id") -> sa.Column:
+    return sa.Column(name, sa.String(64), primary_key=True)
+
+
+workspace = sa.Table(
+    "workspace", metadata, _id(),
+    sa.Column("key", sa.Text, nullable=False),  # where it lives: a folder today, a slug later
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("created", TIME, nullable=False, server_default=NOW),
+    sa.UniqueConstraint("key", name="uq_workspace_key"))
+
+app_user = sa.Table(
+    "app_user", metadata, _id(),
+    sa.Column("email", sa.Text),  # optional: a person may sign in by username alone (0021)
+    sa.Column("username", sa.Text),  # a lower-case handle that signs a person in; unique (0021)
+    sa.Column("name", sa.Text, nullable=False, server_default=""),
+    sa.Column("password_hash", sa.Text),  # null for single-sign-on users
+    sa.Column("subject", sa.Text),  # the identity provider's id for the user
+    sa.Column("active", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("created", TIME, nullable=False, server_default=NOW),
+    sa.UniqueConstraint("email", name="uq_app_user_email"),
+    sa.UniqueConstraint("username", name="uq_app_user_username"),
+    # one account per identity at the provider (package 10.2, part B): a second account can never take the same subject
+    sa.Index("uq_app_user_subject", "subject", unique=True, postgresql_where=sa.text("subject is not null")))
+
+membership = sa.Table(
+    "membership", metadata,
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("user_id", sa.String(64), sa.ForeignKey("app_user.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("role", sa.String(32), nullable=False),
+    sa.CheckConstraint("role in ('owner', 'data_scientist', 'reviewer', 'viewer')", name="role"))
+
+project = sa.Table(
+    "project", metadata, _id(),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("industry", sa.Text, nullable=False),
+    sa.Column("doc", JSONB, nullable=False),  # the whole project document
+    sa.Column("created", TIME, nullable=False, server_default=NOW),
+    sa.Column("updated", TIME, nullable=False, server_default=NOW),
+    sa.Index("ix_project_workspace_updated", "workspace_id", sa.text("updated DESC")))
+
+stage_record = sa.Table(
+    "stage_record", metadata,
+    sa.Column("project_id", sa.String(64), sa.ForeignKey("project.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("stage", sa.String(16), primary_key=True),
+    sa.Column("record", JSONB, nullable=False),
+    sa.Column("written", TIME, nullable=False, server_default=NOW),
+    sa.CheckConstraint("stage in ('data', 'leakage', 'features', 'models', 'final')", name="stage"))
+
+activity = sa.Table(
+    "activity", metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("project_id", sa.String(64), sa.ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("at", sa.Text, nullable=False),  # the entry's own timestamp, as written by the application
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("payload", JSONB),
+    sa.Index("ix_activity_project_id", "project_id", "id"))
+
+transition = sa.Table(
+    "transition", metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("project_id", sa.String(64), sa.ForeignKey("project.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("at", sa.Text),
+    sa.Column("move", sa.Text),
+    sa.Column("status", sa.Text),
+    sa.Column("actor", sa.Text),
+    sa.Column("entry", JSONB, nullable=False),
+    sa.Index("ix_transition_project_id", "project_id", "id"))
+
+draft = sa.Table(
+    "draft", metadata, _id(),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("doc", JSONB, nullable=False),
+    sa.Column("event_seq", sa.BigInteger, nullable=False, server_default="0"),  # last event number; serialises emits per draft
+    sa.Column("created", TIME, nullable=False, server_default=NOW),
+    sa.Column("updated", TIME, nullable=False, server_default=NOW),
+    sa.Index("ix_draft_workspace_updated", "workspace_id", sa.text("updated DESC")))
+
+draft_event = sa.Table(
+    "draft_event", metadata,
+    sa.Column("draft_id", sa.String(64), sa.ForeignKey("draft.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("seq", sa.BigInteger, primary_key=True),
+    sa.Column("at", sa.Text, nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("data", JSONB, nullable=False))
+
+intern_session = sa.Table(
+    "intern_session", metadata, _id(),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("doc", JSONB, nullable=False),
+    sa.Column("created", TIME, nullable=False, server_default=NOW),
+    sa.Column("updated", TIME, nullable=False, server_default=NOW),
+    sa.Index("ix_intern_session_workspace_updated", "workspace_id", sa.text("updated DESC")))
+
+model_request = sa.Table(  # the model gateway's usage log (dclabai/models/usage.py); one row per request
+    "model_request", metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("at", sa.Text, nullable=False),
+    sa.Column("purpose", sa.Text, nullable=False),
+    sa.Column("tier", sa.Text, nullable=False),
+    sa.Column("model", sa.Text, nullable=False),
+    sa.Column("endpoint", sa.Text, nullable=False),  # host only: never a key or a full URL with credentials
+    sa.Column("project_id", sa.String(64)),
+    sa.Column("draft_id", sa.String(64)),
+    sa.Column("input_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("output_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("seconds", sa.Float, nullable=False, server_default="0"),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("outcome", sa.Text, nullable=False),
+    sa.Column("prompt", sa.Text),  # only with DCLAB_LOG_PROMPTS=1
+    sa.Column("cost_eur", sa.Float),  # null when the model has no configured price
+    sa.Column("cost_basis", sa.Text),  # "price", "local" or "no price" (dclabai/models/prices.py)
+    sa.Column("user_id", sa.String(64)),  # the signed-in person the request was for (package 10.6: a monthly limit per user)
+    sa.Column("cache_read_tokens", sa.Integer),   # of input_tokens, those read from the prompt cache (Anthropic); null before 0020
+    sa.Column("cache_write_tokens", sa.Integer),  # of input_tokens, those written to it
+    sa.Index("ix_model_request_workspace_at", "workspace_id", "at"),
+    sa.Index("ix_model_request_project_id", "project_id"))
+
+model_output_check = sa.Table(  # whether a model's output passed the code that checks it (package A1.3)
+    "model_output_check", metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("at", sa.Text, nullable=False),
+    sa.Column("purpose", sa.Text, nullable=False),
+    sa.Column("tier", sa.Text, nullable=False),
+    sa.Column("model", sa.Text, nullable=False),
+    sa.Column("passed", sa.Boolean, nullable=False),
+    sa.Column("reason", sa.Text),  # why it failed, in words; never the model's output or the user's data
+    sa.Index("ix_model_output_check_workspace_at", "workspace_id", "at"))
+
+agent_step = sa.Table(  # one row per step of an agent run (dclabai/agents/traces.py, package A2.3); never a cell value
+    "agent_step", metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("run_id", sa.String(64), nullable=False),  # an intern session id, or a draft id and its turn
+    sa.Column("agent", sa.Text, nullable=False),
+    sa.Column("n", sa.Integer, nullable=False),
+    sa.Column("reply", sa.Integer),  # which model reply asked for the step; null when no model chose it (the standard plan)
+    sa.Column("at", sa.Text, nullable=False),
+    sa.Column("state", sa.Text),  # a summary of what the agent saw (for a project, the graph state string)
+    sa.Column("tool", sa.Text, nullable=False),
+    sa.Column("arguments", JSONB, nullable=False),
+    sa.Column("verdict", sa.Text, nullable=False),  # ok, error, blocked, needs_approval
+    sa.Column("result", sa.Text),  # the tool's one-line summary
+    sa.Column("input_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("output_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("seconds", sa.Float, nullable=False, server_default="0"),
+    sa.Index("ix_agent_step_workspace_id_run_id", "workspace_id", "run_id"))
+
+workspace_lesson = sa.Table(  # a lesson from a finished project, proposed, then accepted or rejected by a reviewer (dclabai/lessons.py, A5.3)
+    "workspace_lesson", metadata, _id(),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("project_id", sa.String(64), nullable=False),  # kept when the project is deleted: an accepted lesson is evidence on its own
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("doc", JSONB, nullable=False),
+    sa.Column("created", TIME, nullable=False, server_default=NOW),
+    sa.Column("updated", TIME, nullable=False, server_default=NOW),
+    sa.CheckConstraint("status in ('proposed', 'accepted', 'rejected', 'superseded')", name="status"),
+    sa.Index("ix_workspace_lesson_workspace_id_status", "workspace_id", "status"),
+    sa.Index("ix_workspace_lesson_project_id", "project_id"))
+
+model_routing = sa.Table(  # which tier serves or shadows each purpose, with its history (dclabai/models/routing.py, A6.4); one row per workspace
+    "model_routing", metadata,
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("doc", JSONB, nullable=False),
+    sa.Column("updated", TIME, nullable=False, server_default=NOW))
+
+model_shadow = sa.Table(  # how a shadow model's answer compared with the served one (dclabai/models/shadow.py, A6.4); never content
+    "model_shadow", metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("at", sa.Text, nullable=False),
+    sa.Column("purpose", sa.Text, nullable=False),
+    sa.Column("primary_tier", sa.Text), sa.Column("primary_model", sa.Text),
+    sa.Column("shadow_tier", sa.Text, nullable=False), sa.Column("shadow_model", sa.Text, nullable=False),
+    sa.Column("project_id", sa.String(64)), sa.Column("draft_id", sa.String(64)),
+    sa.Column("primary_tool", sa.Text), sa.Column("shadow_tool", sa.Text),
+    sa.Column("same_tool", sa.Boolean), sa.Column("same_arguments", sa.Boolean),
+    sa.Column("outcome", sa.Text, nullable=False),
+    sa.Column("seconds", sa.Float, nullable=False, server_default="0"),
+    sa.Column("input_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("output_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Index("ix_model_shadow_workspace_at", "workspace_id", "at"))
+
+stored_file = sa.Table(  # a table or artifact kept in file storage: where, how big, its hash (dclabai/storage/files.py, 9.3); never a credential
+    "stored_file", metadata,
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("key", sa.Text, primary_key=True),  # the path under the workspace folder, made of safe names
+    sa.Column("size", sa.BigInteger, nullable=False),
+    sa.Column("sha256", sa.String(64), nullable=False),
+    sa.Column("content_type", sa.Text, nullable=False),
+    sa.Column("backend", sa.Text, nullable=False),  # local or s3
+    sa.Column("recorded", sa.Text, nullable=False))
+
+job = sa.Table(  # a piece of background work: a stage run, a data pipeline, synthetic data, an intern turn (dclabai/jobs, 10.3)
+    "job", metadata, _id(),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("key", sa.Text, nullable=False),  # what it works on: a project, an intern session, a draft's asset
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("cancel_requested", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("worker", sa.Text),  # the worker that claimed it
+    sa.Column("heartbeat", sa.Float),  # seconds since the epoch; a running job whose worker stops beating is interrupted
+    sa.Column("created", TIME, nullable=False, server_default=NOW),
+    sa.Column("doc", JSONB, nullable=False),  # the whole job: payload, progress, times, error, attempts
+    sa.CheckConstraint("status in ('queued', 'running', 'done', 'failed', 'cancelled', 'interrupted')", name="status"),
+    sa.Index("ix_job_workspace_id_status_created", "workspace_id", "status", "created"),
+    sa.Index("ix_job_workspace_id_kind_key", "workspace_id", "kind", "key"),
+    # one queued or running job per key: two app instances cannot start the same project's stages at once
+    sa.Index("uq_job_active_key", "workspace_id", "kind", "key", unique=True, postgresql_where=sa.text("status in ('queued', 'running')")))
+
+audit_event = sa.Table(  # every governed action, append-only: a trigger refuses update and delete (dclabai/audit.py, 10.4)
+    "audit_event", metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id"), nullable=False),  # no cascade: an audit outlives what it records
+    sa.Column("at", sa.Text, nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("actor", sa.Text, nullable=False),  # human or agent
+    sa.Column("who", sa.Text, nullable=False),  # how the page names them
+    sa.Column("user_id", sa.String(64)),  # the signed-in user, once accounts exist (10.2)
+    sa.Column("project_id", sa.String(64)),  # kept when the project is deleted
+    sa.Column("project_name", sa.Text),
+    sa.Column("draft_id", sa.String(64)),
+    sa.Column("move", sa.Text),
+    sa.Column("status", sa.Text),
+    sa.Column("detail", JSONB, nullable=False),
+    sa.Index("ix_audit_event_workspace_id_id", "workspace_id", "id"),
+    sa.Index("ix_audit_event_workspace_id_kind", "workspace_id", "kind"),
+    sa.Index("ix_audit_event_workspace_id_project_id", "workspace_id", "project_id"))
+
+experience_event = sa.Table(  # every event of every session, append-only: a trigger refuses update and delete (dclabai/experience, 19.2)
+    "experience_event", metadata,
+    sa.Column("id", sa.String(40), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id"), nullable=False),  # no cascade: the record outlives a project
+    sa.Column("at", sa.Text, nullable=False),  # UTC ISO 8601 with microseconds: text order is time order
+    sa.Column("seq", sa.BigInteger, nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("actor", sa.Text, nullable=False),
+    sa.Column("visit", sa.String(40)),
+    sa.Column("user_id", sa.String(64)),
+    sa.Column("conversation", sa.String(64)),  # a draft or an intern session
+    sa.Column("project_id", sa.String(64)),
+    sa.Column("run_id", sa.String(64)),
+    sa.Column("job_id", sa.String(64)),
+    sa.Column("request_id", sa.String(80)),
+    sa.Column("model_request", sa.String(80)),
+    sa.Column("trace_id", sa.String(32)),  # 23.11: the W3C trace of the request, shared by its events, jobs and model requests
+    sa.Column("doc", JSONB, nullable=False),  # the event whole (dclab_core.experience_event, v1 or v2)
+    sa.Index("ix_experience_event_workspace_id_at", "workspace_id", "at"),
+    sa.Index("ix_experience_event_workspace_id_visit", "workspace_id", "visit"),
+    sa.Index("ix_experience_event_workspace_id_project_id", "workspace_id", "project_id"),
+    sa.Index("ix_experience_event_workspace_id_conversation", "workspace_id", "conversation"),
+    *[sa.Index(f"ix_experience_event_workspace_id_{c}", "workspace_id", c) for c in ("user_id", "run_id", "job_id", "request_id", "model_request", "kind", "trace_id")])
+
+decision_record = sa.Table(  # every decision DCLab makes, append-only (dclabai/ledger, 19.7)
+    "decision_record", metadata,
+    sa.Column("id", sa.String(80), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("at", sa.Text, nullable=False), sa.Column("point", sa.Text, nullable=False), sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("used", sa.Text, nullable=False), sa.Column("project_id", sa.String(64)), sa.Column("draft_id", sa.String(64)),
+    sa.Column("run_id", sa.String(80)), sa.Column("conversation", sa.String(80)),
+    sa.Column("doc", JSONB, nullable=False),  # dclab_core.decision_record.v1
+    *[sa.Index(f"ix_decision_record_workspace_id_{c}", "workspace_id", c) for c in ("at", "point", "project_id", "draft_id", "run_id")])
+
+decision_label = sa.Table(  # what was right, from one source; a new label supersedes, never edits (19.7, 19.8)
+    "decision_label", metadata,
+    sa.Column("id", sa.String(80), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("at", sa.Text, nullable=False), sa.Column("record_id", sa.String(80), nullable=False), sa.Column("point", sa.Text, nullable=False),
+    sa.Column("source", sa.Text, nullable=False), sa.Column("supersedes", sa.String(80)),
+    sa.Column("doc", JSONB, nullable=False),  # dclab_core.decision_label.v1
+    *[sa.Index(f"ix_decision_label_workspace_id_{c}", "workspace_id", c) for c in ("record_id", "point", "source")])
+
+decision_outcome = sa.Table(  # how a decision turned out, append-only (dclabai/ledger/outcomes.py, 23.5)
+    "decision_outcome", metadata,
+    sa.Column("id", sa.String(80), primary_key=True),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("at", sa.Text, nullable=False), sa.Column("record_id", sa.String(80), nullable=False), sa.Column("point", sa.Text, nullable=False),
+    sa.Column("project_id", sa.String(64)), sa.Column("run_id", sa.String(80)), sa.Column("observed", sa.Text, nullable=False),
+    sa.Column("doc", JSONB, nullable=False),  # dclab_core.outcome.v1
+    *[sa.Index(f"ix_decision_outcome_workspace_id_{c}", "workspace_id", c) for c in ("record_id", "point", "project_id")])
+
+model_pause = sa.Table(  # requests to an endpoint and model stop until a time, after a refusal that stays (models/pause.py, 10.5)
+    "model_pause", metadata,
+    sa.Column("key", sa.Text, primary_key=True),  # endpoint, model and a hash of the API key: never the key
+    sa.Column("until", sa.Float, nullable=False),  # seconds since the epoch
+    sa.Column("reason", sa.Text, nullable=False))
+
+user_session = sa.Table(  # a signed-in browser (dclabai/accounts, 10.2): the cookie's token is never stored, only its SHA-256
+    "user_session", metadata,
+    sa.Column("id", sa.String(64), primary_key=True),
+    sa.Column("user_id", sa.String(64), sa.ForeignKey("app_user.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("csrf", sa.Text, nullable=False),  # the request token this session's writes carry
+    sa.Column("started", sa.Float, nullable=False),
+    sa.Column("last_seen", sa.Float, nullable=False),
+    sa.Column("expires", sa.Float, nullable=False),
+    sa.Index("ix_user_session_user_id", "user_id"))
+
+api_token = sa.Table(  # a personal API token for /mcp clients and scripts (10.2): acts as its user in one workspace; only its hash is kept
+    "api_token", metadata,
+    sa.Column("id", sa.String(32), primary_key=True),
+    sa.Column("user_id", sa.String(64), sa.ForeignKey("app_user.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("workspace_id", sa.String(64), sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("token_hash", sa.String(64), nullable=False),
+    sa.Column("prefix", sa.Text, nullable=False),  # the first characters, so a person can tell their tokens apart
+    sa.Column("created", sa.Float, nullable=False),
+    sa.Column("last_used", sa.Float),
+    sa.Column("revoked", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.UniqueConstraint("token_hash", name="uq_api_token_token_hash"),
+    sa.Index("ix_api_token_user_id", "user_id"))
+
+usage_counter = sa.Table(  # requests and bytes counted per user and per workspace in a window (dclabai/limits.py, 10.6)
+    "usage_counter", metadata,
+    sa.Column("scope", sa.Text, primary_key=True),  # user:<id> or workspace:<id>
+    sa.Column("kind", sa.Text, primary_key=True),   # requests or upload_bytes
+    sa.Column("window", sa.Float, primary_key=True),  # the window's start, seconds since the epoch
+    sa.Column("amount", sa.Float, nullable=False))
+
+TABLES = [t.name for t in metadata.sorted_tables]
+
+
+# 28.1: LangGraph keeps a walk's checkpoints in the same database (its own tables, made by its saver's ``setup()``); they are
+# not modelled here, and a migration never creates, changes or drops them
+FOREIGN_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations")
+
+
+def not_ours(object_: object, name: str, type_: str, reflected: bool, compare_to: object) -> bool:
+    """Alembic's ``include_object``: false for the tables another library owns in this database."""
+    return not (type_ == "table" and name in FOREIGN_TABLES) and not (type_ in ("index", "column", "unique_constraint", "foreign_key_constraint")
+                                                                     and getattr(getattr(object_, "table", None), "name", None) in FOREIGN_TABLES)

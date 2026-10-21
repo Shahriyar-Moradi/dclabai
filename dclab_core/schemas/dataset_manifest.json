@@ -1,0 +1,223 @@
+{
+  "$defs": {
+    "Source": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "decision",
+            "label",
+            "event",
+            "visit",
+            "conversation",
+            "run",
+            "project",
+            "draft",
+            "package",
+            "flag",
+            "step"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ],
+      "title": "Source",
+      "type": "object"
+    }
+  },
+  "$id": "https://dclab.dev/schemas/dclab_core.dataset_manifest.v8.json",
+  "additionalProperties": false,
+  "description": "What a dataset holds and where every row came from.",
+  "properties": {
+    "builder": {
+      "enum": [
+        "decisions",
+        "conversations",
+        "preferences",
+        "trajectories",
+        "workflows",
+        "failures",
+        "development",
+        "outcomes",
+        "episodes",
+        "model_calls",
+        "problem_maps",
+        "routes",
+        "twin",
+        "team_walks",
+        "case_trajectories"
+      ],
+      "title": "Builder",
+      "type": "string"
+    },
+    "built_at": {
+      "title": "Built At",
+      "type": "string"
+    },
+    "commit": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "v4: the commit of the code that built the set (None outside a repository).",
+      "title": "Commit"
+    },
+    "consent": {
+      "description": "The basis, in words.",
+      "maxLength": 300,
+      "title": "Consent",
+      "type": "string"
+    },
+    "counts": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "type": "integer"
+        },
+        "type": "object"
+      },
+      "title": "Counts",
+      "type": "object"
+    },
+    "files": {
+      "description": "v4: the files of the set (rows.jsonl, rows.parquet, sealed.jsonl\u2026).",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 20,
+      "title": "Files",
+      "type": "array"
+    },
+    "levels": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "description": "v2 (23.1): rows by the consent level their records were written under.",
+      "title": "Levels",
+      "type": "object"
+    },
+    "limits": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 20,
+      "title": "Limits",
+      "type": "array"
+    },
+    "name": {
+      "maxLength": 120,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "policy": {
+      "description": "How rows were grouped and split.",
+      "maxLength": 600,
+      "title": "Policy",
+      "type": "string"
+    },
+    "rows": {
+      "minimum": 0,
+      "title": "Rows",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "dclab_core.dataset_manifest.v8",
+      "default": "dclab_core.dataset_manifest.v8",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "scrubber": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "v4 (23.10): the version of the redaction rules the text in the rows went through.",
+      "title": "Scrubber"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/Source"
+      },
+      "maxItems": 2000000,
+      "title": "Sources",
+      "type": "array"
+    },
+    "splits": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Splits",
+      "type": "object"
+    },
+    "use": {
+      "anyOf": [
+        {
+          "enum": [
+            "improve",
+            "train"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The consent it was built under; None for the owner's own records.",
+      "title": "Use"
+    },
+    "version": {
+      "maxLength": 20,
+      "minLength": 1,
+      "title": "Version",
+      "type": "string"
+    },
+    "workspace": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Workspace"
+    }
+  },
+  "required": [
+    "schema_version",
+    "builder",
+    "name",
+    "version",
+    "built_at",
+    "consent",
+    "rows",
+    "policy"
+  ],
+  "title": "DatasetManifest",
+  "type": "object"
+}

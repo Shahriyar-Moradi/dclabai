@@ -1,0 +1,720 @@
+{
+  "$defs": {
+    "RunCode": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The code's commit; None outside a repository.",
+          "title": "Commit"
+        },
+        "core": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "dclab_core's version.",
+          "title": "Core"
+        },
+        "diff_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The hash of that difference: two dirty runs ran the same code only when it is equal.",
+          "title": "Diff Sha256"
+        },
+        "dirty": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "True when tracked files differed from the commit.",
+          "title": "Dirty"
+        },
+        "prompts": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Short hashes of the prompts and tool schemas a model was given.",
+          "title": "Prompts",
+          "type": "object"
+        },
+        "runner": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What ran it: a module, an agent and its version.",
+          "title": "Runner"
+        }
+      },
+      "title": "RunCode",
+      "type": "object"
+    },
+    "RunInputs": {
+      "additionalProperties": false,
+      "description": "What a run read. A field it did not read is None or empty, never guessed.",
+      "properties": {
+        "data_columns": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Data Columns"
+        },
+        "data_rows": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Data Rows"
+        },
+        "data_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The table's SHA-256 as recorded when it was attached.",
+          "title": "Data Sha256"
+        },
+        "decisions": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": "The choices of earlier runs this run used, by step.",
+          "title": "Decisions",
+          "type": "object"
+        },
+        "refs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Ids and hashes of what it read that no field above names: a dataset version, a split plan, an agent's context or tool catalog digest.",
+          "title": "Refs",
+          "type": "object"
+        },
+        "sampling": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": "How rows were chosen: a rule and its numbers.",
+          "title": "Sampling",
+          "type": "object"
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Seed"
+        },
+        "settings": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Settings",
+          "type": "object"
+        },
+        "solution_hash": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The solution's hash (the studio's graph.solution_hash).",
+          "title": "Solution Hash"
+        },
+        "upstream": {
+          "description": "The runs whose outputs this run read.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "title": "Upstream",
+          "type": "array"
+        }
+      },
+      "title": "RunInputs",
+      "type": "object"
+    },
+    "RunOutputs": {
+      "additionalProperties": false,
+      "properties": {
+        "chosen": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chosen"
+        },
+        "high": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "High"
+        },
+        "low": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The interval's lower end, when the run measured one.",
+          "title": "Low"
+        },
+        "metric": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metric"
+        },
+        "numbers": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Every number the run wrote, by its path in the record.",
+          "title": "Numbers",
+          "type": "object"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "RunOutputs",
+      "type": "object"
+    },
+    "Step": {
+      "additionalProperties": false,
+      "description": "One action of a run (package 23.8, ``dclab_core.steps``): what it was, with what, on what shape, and a digest of what it made.",
+      "properties": {
+        "cols_in": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cols In"
+        },
+        "cols_out": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cols Out"
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A hash of what the step produced (``steps.digest_of``); equal for a faithful rerun.",
+          "title": "Digest"
+        },
+        "fold": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fold"
+        },
+        "index": {
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "load",
+            "clean",
+            "impute",
+            "encode",
+            "transform",
+            "fold",
+            "fit",
+            "predict",
+            "metric",
+            "select",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "metric": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metric"
+        },
+        "name": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxProperties": 16,
+          "title": "Params",
+          "type": "object"
+        },
+        "rows_in": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rows In"
+        },
+        "rows_out": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rows Out"
+        },
+        "seconds": {
+          "default": 0.0,
+          "minimum": 0,
+          "title": "Seconds",
+          "type": "number"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "index",
+        "name",
+        "kind"
+      ],
+      "title": "Step",
+      "type": "object"
+    }
+  },
+  "$id": "https://dclab.dev/schemas/dclab_core.run_record.v2.json",
+  "additionalProperties": false,
+  "description": "One run: what it read, what it was told, what it made, and the code that ran it.",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/RunCode"
+    },
+    "draft": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Draft"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "maxLength": 600,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Why a failed run failed (its type and message).",
+      "title": "Error"
+    },
+    "fingerprint": {
+      "default": "",
+      "description": "The hash of the inputs and parameters (:func:`fingerprint`).",
+      "maxLength": 64,
+      "title": "Fingerprint",
+      "type": "string"
+    },
+    "finished": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Finished"
+    },
+    "inputs": {
+      "$ref": "#/$defs/RunInputs"
+    },
+    "job": {
+      "anyOf": [
+        {
+          "maxLength": 80,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Job"
+    },
+    "kind": {
+      "enum": [
+        "stage",
+        "pipeline",
+        "agent",
+        "job"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "name": {
+      "description": "The stage, the pipeline step or the agent.",
+      "maxLength": 120,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "outputs": {
+      "$ref": "#/$defs/RunOutputs"
+    },
+    "params": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "title": "Params",
+      "type": "object"
+    },
+    "parent": {
+      "anyOf": [
+        {
+          "maxLength": 80,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The run this one was part of.",
+      "title": "Parent"
+    },
+    "project": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Project"
+    },
+    "run": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Run",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "dclab_core.run_record.v2",
+      "default": "dclab_core.run_record.v2",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "seconds": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Seconds"
+    },
+    "started": {
+      "title": "Started",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "failed",
+        "stopped"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "steps": {
+      "description": "v2 (23.8): what the run did, one entry per cleaning action, transform, fold, fit, prediction and metric, each with a digest of what it produced.",
+      "items": {
+        "$ref": "#/$defs/Step"
+      },
+      "maxItems": 600,
+      "title": "Steps",
+      "type": "array"
+    },
+    "steps_dropped": {
+      "default": 0,
+      "description": "v2: steps taken beyond MAX_STEPS and not kept.",
+      "minimum": 0,
+      "title": "Steps Dropped",
+      "type": "integer"
+    },
+    "workspace": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Workspace"
+    }
+  },
+  "required": [
+    "schema_version",
+    "run",
+    "kind",
+    "name",
+    "status",
+    "started"
+  ],
+  "title": "RunRecord",
+  "type": "object"
+}

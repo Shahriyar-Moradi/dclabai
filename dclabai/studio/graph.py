@@ -1,0 +1,588 @@
+"""The controlled workflow graph: ten steps, the moves allowed between them, and a validator.
+
+A person or the intern *proposes* a move (run a stage, save a solution, approve a
+choice, approve a gate, capture what was learned). ``check`` decides, with plain
+deterministic code, whether the move exists in the graph, whether its prerequisites
+and gates are met, and which rules and precedents apply. ``log`` writes every verdict,
+allowed or not, to the project's transition log. That log is the audit trail and the
+trajectory data a future policy model learns from.
+
+The LLM is the decision-maker inside the graph, never the owner of it (DCLAB-R20).
+
+Steps (WF-01 … WF-10) and the engine stage that runs each one:
+
+    WF-01 solution · WF-02 source and lineage · WF-03 split design   (declared, no stage)
+    WF-04 data · WF-05 leakage · WF-06 features · WF-07 models        (one stage each)
+    WF-08 + WF-09 final (tuning on training folds, then the holdout once)
+    WF-10 knowledge capture (export notebook, report, training examples)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from .store import STAGE_KEYS, ProjectStore, now
+
+NODES: list[dict[str, Any]] = [
+    {"id": "WF-01", "name": "Solution draft", "stage": None, "rules": ["DCLAB-R01", "DCLAB-R18"],
+     "exit": "A saved solution: target, prediction moment, forbidden columns with reasons, metric."},
+    {"id": "WF-02", "name": "Source and lineage", "stage": None, "rules": ["DCLAB-R09", "DCLAB-R21"],
+     "exit": "A data snapshot with its SHA-256, row count and file name."},
+    {"id": "WF-03", "name": "Split design", "stage": None, "rules": ["DCLAB-R02", "DCLAB-R17"],
+     "exit": "The split follows the solution: by time, by group, or stratified; the holdout is sealed."},
+    {"id": "WF-04", "name": "Train-only EDA", "stage": "data", "rules": ["DCLAB-R03", "DCLAB-R12"],
+     "exit": "A training-only profile with its risks."},
+    {"id": "WF-05", "name": "Leakage audit", "stage": "leakage", "rules": ["DCLAB-R04", "DCLAB-R05", "DCLAB-R06"],
+     "exit": "Forbidden columns blocked, review candidates listed, severity measured on identical folds."},
+    {"id": "WF-06", "name": "Feature ladder", "stage": "features", "rules": ["DCLAB-R07", "DCLAB-R08", "DCLAB-R10", "DCLAB-R11"],
+     "exit": "A recipe chosen by the declared tolerance."},
+    {"id": "WF-07", "name": "Algorithm screen", "stage": "models", "rules": ["DCLAB-R13", "DCLAB-R14"],
+     "exit": "Families screened on identical folds; the rule's pick and the runner-up."},
+    {"id": "WF-08", "name": "Conservative optimization", "stage": "final", "rules": ["DCLAB-R15", "DCLAB-R16"],
+     "exit": "Tuning kept only if it beats the baseline by the declared margin."},
+    {"id": "WF-09", "name": "Reliability challenge", "stage": "final", "rules": ["DCLAB-R17", "DCLAB-R19", "DCLAB-R22"],
+     "exit": "The holdout used once, with an interval, calibration and operating points."},
+    {"id": "WF-10", "name": "Knowledge capture", "stage": None, "rules": ["DCLAB-R20", "DCLAB-R21"],
+     "exit": "Notebook, report and training examples exported."},
+]
+NODE_IDS = [n["id"] for n in NODES]
+NODE_BY_ID = {n["id"]: n for n in NODES}
+STAGE_NODE = {"data": "WF-04", "leakage": "WF-05", "features": "WF-06", "models": "WF-07", "final": "WF-09"}
+# Revisits the graph allows on purpose. Reopening the solution is allowed from any step.
+REVISITS = {("WF-05", "WF-01"): "a leak changes the solution", ("WF-07", "WF-06"): "the screen sends you back to the features",
+            ("WF-09", "WF-03"): "a shift needs a new split"}
+GATES = {"solution": "The owner signs the solution before WF-04.",
+         "holdout": "The owner approves opening the holdout (WF-09)."}
+DEFAULT_POLICY = {"require_solution_signoff": False, "require_holdout_approval": False}
+MOVES = ("run_stage", "set_solution", "approve_stage", "approve_gate", "capture",
+         "create_project", "attach_data", "set_settings", "propose_solution", "attach_labels", "attach_table",
+         "run_programme", "drop_leaf", "forbid_columns", "set_brief")  # set_brief (30.14): a person's Solution Brief; the last five: every other project write; run_programme (24.5) runs a problem of several parts and reads its holdout once; drop_leaf drops a blocked leaf of it
+DONE = ("completed", "approved")
+
+
+class GraphBlocked(ValueError):
+    """A move the validator did not allow. ``verdict`` says why."""
+
+    def __init__(self, verdict: "Verdict"):
+        super().__init__(verdict.message)
+        self.verdict = verdict
+
+
+@dataclass
+class Verdict:
+    move: str
+    actor: str
+    status: str  # allowed | blocked | needs_approval
+    node_from: str | None
+    node_to: str | None
+    message: str
+    checks: list[dict[str, Any]] = field(default_factory=list)
+    rules: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
+    args: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def allowed(self) -> bool:
+        return self.status == "allowed"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------- state
+
+
+# Names used before the prediction contract was renamed to the solution; still accepted from old clients.
+LEGACY_MOVES = {"set_contract": "set_solution"}
+LEGACY_GATES = {"contract": "solution"}
+LEGACY_POLICY = {"require_contract_signoff": "require_solution_signoff"}
+
+
+def policy(project: dict[str, Any]) -> dict[str, Any]:
+    own = {LEGACY_POLICY.get(k, k): v for k, v in (project.get("policy") or {}).items()}
+    return {**DEFAULT_POLICY, **own}
+
+
+def solution_hash(solution: dict[str, Any] | None) -> str | None:
+    if not solution:
+        return None
+    return hashlib.sha256(json.dumps(solution, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def solution_signed(project: dict[str, Any]) -> bool:
+    signoff = project.get("signoff") or {}
+    return bool(project.get("solution")) and signoff.get("solution_hash") == solution_hash(project.get("solution"))
+
+
+def brief_problems(project: dict[str, Any]) -> list[str]:
+    """30.14: why the project's Solution Brief cannot be signed (G3), or why it cannot be read."""
+    from dclab_core.solution_brief import SolutionBrief, problems
+
+    try:
+        return problems(SolutionBrief.read(project["brief"]))
+    except Exception as error:  # noqa: BLE001 - a brief that cannot be read is never signed
+        return [f"the brief cannot be read ({type(error).__name__})"]
+
+
+def brief_signed(project: dict[str, Any]) -> bool:
+    """30.14 (D3): the project's brief signed with its solution, both unchanged since: the one checkpoint that also covers
+    the holdout read (a solution changed after the signature uncovers it, whatever the brief says)."""
+    if not project.get("brief") or not project.get("solution"):
+        return False  # a programme's plan does not judge a bar: its holdout keeps its own approval
+    from dclab_core.solution_brief import SolutionBrief, fingerprint, signed
+
+    try:
+        brief = SolutionBrief.read(project["brief"])
+    except Exception:  # noqa: BLE001
+        return False
+    return signed(brief) and (project.get("signoff") or {}).get("brief_hash") == fingerprint(brief) and solution_signed(project)
+
+
+def _stage_status(project: dict[str, Any], stage: str) -> str:
+    return (project.get("stages", {}).get(stage) or {}).get("status", "pending")
+
+
+def node_states(project: dict[str, Any]) -> dict[str, str]:
+    """done · current · waiting (a person must act) · running · failed · todo, for every step."""
+    pol = policy(project)
+    raw: dict[str, str] = {}
+    has_solution = bool(project.get("solution"))
+    signed_ok = solution_signed(project) or not pol["require_solution_signoff"]
+    raw["WF-01"] = "done" if has_solution and signed_ok else ("waiting" if has_solution else "todo")
+    raw["WF-02"] = "done" if (project.get("data") or {}).get("sha256") else "todo"
+    raw["WF-03"] = "done" if raw["WF-01"] == "done" and raw["WF-02"] == "done" else "todo"
+    for stage in STAGE_KEYS:
+        status = _stage_status(project, stage)
+        value = "done" if status in DONE else "running" if status in ("running", "queued") else "failed" if status == "failed" else "todo"
+        for node in (["WF-08", "WF-09"] if stage == "final" else [STAGE_NODE[stage]]):
+            raw[node] = value
+    programme = ((project.get("programme") or {}).get("document") or {}).get("state")  # 24.5: a programme stands in for the stages' work on the nodes it covers
+    if programme in ("leaves_built", "composed"):
+        for node in ("WF-04", "WF-05", "WF-06", "WF-07"):
+            raw[node] = "done"
+    if programme == "composed":
+        raw["WF-08"] = raw["WF-09"] = "done"
+    raw["WF-10"] = "done" if project.get("captured") and raw["WF-09"] == "done" else "todo"
+    current = next((n for n in NODE_IDS if raw[n] != "done"), None)
+    out = {}
+    for n in NODE_IDS:
+        out[n] = "current" if n == current and raw[n] == "todo" else raw[n]
+    return out
+
+
+def current_node(project: dict[str, Any]) -> str | None:
+    states = node_states(project)
+    return next((n for n in NODE_IDS if states[n] != "done"), None)
+
+
+def state_string(project: dict[str, Any]) -> str:
+    """One character per step (d done, c current, w waiting, r running, f failed, - todo); compact trajectory state."""
+    code = {"done": "d", "current": "c", "waiting": "w", "running": "r", "failed": "f", "todo": "-"}
+    states = node_states(project)
+    return "".join(code[states[n]] for n in NODE_IDS)
+
+
+# ---------------------------------------------------------------------- validator
+
+
+def _check(name: str, ok: bool, detail: str) -> dict[str, Any]:
+    return {"name": name, "ok": bool(ok), "detail": detail}
+
+
+def check(project: dict[str, Any], move: str, actor: str = "human", **args: Any) -> Verdict:
+    """Validate one proposed move. Pure: reads the project, changes nothing."""
+    if actor not in ("human", "agent"):
+        actor = "agent"
+    clean = {k: v for k, v in args.items() if v not in (None, "")}
+    move = LEGACY_MOVES.get(move, move)
+    if "gate" in clean:
+        clean["gate"] = LEGACY_GATES.get(clean["gate"], clean["gate"])
+    frm = current_node(project) if project else None
+    if move not in MOVES:
+        return Verdict(move, actor, "blocked", frm, None, f"Unknown move {move!r}. Moves: {', '.join(MOVES)}.",
+                       [_check("Move exists", False, f"{move!r} is not one of {', '.join(MOVES)}")], args=clean)
+    return {"run_stage": _run_stage, "set_solution": _set_solution, "approve_stage": _approve_stage,
+            "approve_gate": _approve_gate, "capture": _capture, "create_project": _create_project,
+            "attach_data": _attach_data, "set_settings": _set_settings, "propose_solution": _propose_solution,
+            "attach_labels": _attach_labels, "attach_table": _attach_table, "run_programme": _run_programme,
+            "drop_leaf": _drop_leaf, "forbid_columns": _forbid_columns, "set_brief": _set_brief}[move](project, actor, frm, clean)
+
+
+def _verdict(move: str, actor: str, frm: str | None, to: str | None, checks: list[dict[str, Any]], rules: list[str],
+             evidence: list[str], side_effects: list[str], args: dict[str, Any], approval_checks: tuple[str, ...] = ()) -> Verdict:
+    failed = [c for c in checks if not c["ok"]]
+    if not failed:
+        return Verdict(move, actor, "allowed", frm, to, "Allowed.", checks, rules, evidence, side_effects, args)
+    needs_person = all(c["name"] in approval_checks for c in failed)
+    status = "needs_approval" if needs_person else "blocked"
+    first = failed[0]
+    message = (f"Needs a person: {first['detail']}" if needs_person else f"Blocked: {first['detail']}")
+    return Verdict(move, actor, status, frm, to, message, checks, rules, evidence, side_effects, args)
+
+
+def _run_stage(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    stage = args.get("stage")
+    if stage not in STAGE_KEYS:
+        return Verdict("run_stage", actor, "blocked", frm, None, f"Unknown stage {stage!r}.", [_check("Stage exists", False, f"Stages: {', '.join(STAGE_KEYS)}")], args=args)
+    to = STAGE_NODE[stage]
+    pol = policy(project)
+    node = NODE_BY_ID["WF-08" if stage == "final" else to]
+    rules = list(node["rules"]) + (NODE_BY_ID["WF-09"]["rules"] if stage == "final" else [])
+    evidence: list[str] = []
+    side: list[str] = []
+    checks = [
+        _check("Solution", bool(project.get("solution")), "Save the solution first (WF-01)."),
+        _check("Data", bool(project.get("data")), "Attach a table first (WF-02)."),
+    ]
+    if pol["require_solution_signoff"]:
+        checks.append(_check("Solution signed", solution_signed(project), "The owner must sign the current solution before WF-04 (gate: solution)."))
+    index = STAGE_KEYS.index(stage)
+    if index:
+        previous = STAGE_KEYS[index - 1]
+        prev_node = STAGE_NODE[previous]
+        checks.append(_check("Edge exists", _stage_status(project, previous) in DONE,
+                             f"{frm or prev_node} → {to} is not an edge yet: run `{previous}` ({prev_node}) first."))
+    running = project.get("running")
+    checks.append(_check("Nothing else running", running in (None, stage) or _stage_status(project, stage) == "queued",
+                         f"`{running}` is still running on this project."))
+    status = _stage_status(project, stage)
+    later_done = [s for s in STAGE_KEYS[index + 1:] if _stage_status(project, s) in DONE]
+    if status in DONE and stage != "final":
+        side.append(f"Reruns {to}; later results ({', '.join(later_done)}) are cleared and must run again." if later_done else f"Reruns {to}.")
+    if stage == "final":
+        uses = int(project.get("holdout_uses", 0) or 0)
+        evidence += ["PIT-006"]
+        if uses:
+            reason = str(args.get("reuse_reason") or "").strip()
+            if actor == "agent":
+                checks.append(_check("Holdout unused", False, f"The holdout was already used {uses} time(s). The intern may not reuse it; choosing by holdout score makes it optimistic (PIT-006)."))
+            else:
+                checks.append(_check("Holdout reuse confirmed", bool(reason),
+                                     f"The holdout was already used {uses} time(s). Reusing it makes the score optimistic (PIT-006); confirm with a written reason."))
+                if reason:
+                    side.append(f"Holdout use number {uses + 1}, recorded with the reason: {reason[:200]}")
+        if pol["require_holdout_approval"] and actor == "agent":
+            approved = any(a.get("gate") == "holdout" and not a.get("used") for a in project.get("approvals", [])) or brief_signed(project)  # D3: a signed brief covers the one read
+            checks.append(_check("Owner approval", approved, "The owner must approve opening the holdout (gate: holdout), or sign the Solution Brief."))
+        side.append("Consumes the holdout once.")
+    approval = ("Solution signed", "Owner approval") + (("Holdout reuse confirmed",) if actor == "human" else ())
+    return _verdict("run_stage", actor, frm, to, checks, rules, evidence, side, args, approval)
+
+
+def _set_solution(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    from .data import target_refusal
+
+    checks = [_check("Data", bool(project.get("data")), "Attach a table before writing the solution.")]
+    if args.get("target") and project.get("data"):  # an identifier, a constant or a row number is never the outcome
+        profiled = {c.get("name"): c for c in ((project["data"].get("profile") or {}).get("columns") or [])}
+        refused = target_refusal(profiled.get(args["target"]))
+        checks.append(_check("Target can be an outcome", refused is None, refused or ""))
+    side = []
+    ran = [s for s in STAGE_KEYS if _stage_status(project, s) in DONE]
+    if ran:
+        side.append(f"Reopens WF-01: clears {', '.join(ran)}.")
+    if int(project.get("holdout_uses", 0) or 0):
+        side.append("The holdout stays used: a new estimate on it will need a reason.")
+    if actor == "agent" and solution_signed(project):
+        checks.append(_check("Signed solution unchanged", False, "The owner signed this solution; only a person may change it."))
+    return _verdict("set_solution", actor, frm, "WF-01", checks, ["DCLAB-R01"], [], side, args, ("Signed solution unchanged",))
+
+
+def _approve_stage(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    stage = args.get("stage")
+    if stage not in STAGE_KEYS:
+        return Verdict("approve_stage", actor, "blocked", frm, None, f"Unknown stage {stage!r}.", [_check("Stage exists", False, f"Stages: {', '.join(STAGE_KEYS)}")], args=args)
+    checks = [_check("Stage completed", _stage_status(project, stage) in DONE, f"`{stage}` has not completed; there is nothing to approve.")]
+    side = []
+    choice = args.get("choice")
+    holdout_used = int(project.get("holdout_uses", 0) or 0) > 0
+    if choice and stage != "final":
+        side.append("Clears every later stage.")
+        if holdout_used:
+            if actor == "agent":
+                checks.append(_check("Holdout unused", False, "The holdout is already used; changing an earlier choice now would mean choosing by holdout score (PIT-006)."))
+            else:
+                side.append("The holdout is already used: the new choice cannot be judged honestly on it.")
+    return _verdict("approve_stage", actor, frm, STAGE_NODE[stage], checks, ["DCLAB-R16", "DCLAB-R17"], ["PIT-006"] if holdout_used else [], side, args)
+
+
+def _approve_gate(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    gate = args.get("gate")
+    checks = [_check("Gate exists", gate in GATES, f"Gates: {', '.join(GATES)}."),
+              _check("A person approves", actor == "human", "Only a person can approve a gate; ask the owner.")]
+    if gate == "solution":
+        checks.append(_check("Solution", bool(project.get("solution")) or bool(project.get("programme_plan")), "There is no solution or plan to sign."))
+        if project.get("brief"):  # 30.14: G3: a brief is signed only with a success bar, a baseline and an alternative
+            missing = brief_problems(project)
+            checks.append(_check("Brief complete", not missing, "The Solution Brief cannot be signed yet: " + "; ".join(missing) + "."))
+    to = "WF-01" if gate == "solution" else "WF-09" if gate == "holdout" else None
+    return _verdict("approve_gate", actor, frm, to, checks, ["DCLAB-R01"] if gate == "solution" else ["DCLAB-R17"], [], [], args)
+
+
+def _capture(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    checks = [_check("Solution", bool(project.get("solution")), "Nothing to capture: there is no solution yet.")]
+    side = [] if _stage_status(project, "final") in DONE else ["The final stage has not run: the export is a work in progress and WF-10 stays open."]
+    return _verdict("capture", actor, frm, "WF-10", checks, ["DCLAB-R20", "DCLAB-R21"], [], side, args)
+
+
+def _create_project(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    checks = [_check("Name", bool(str(args.get("name") or "").strip()), "Give the project a name."),
+              _check("Goal", bool(str(args.get("goal") or "").strip()), "State the goal: what should be predicted, for whom (WF-01 starts from it).")]
+    # The log keeps the name, not the goal: the goal is the user's own words and the transition log feeds trajectories.
+    return _verdict("create_project", actor, None, "WF-01", checks, ["DCLAB-R01"], [], [], {"name": str(args.get("name") or "")[:80]})
+
+
+def _not_running(project: dict[str, Any]) -> dict[str, Any]:
+    running = project.get("running")
+    return _check("Nothing running", not running, f"`{running}` is still running on this project.")
+
+
+def _attach_data(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    checks = [_not_running(project)]
+    side = []
+    if project.get("data"):
+        ran = [s for s in STAGE_KEYS if _stage_status(project, s) in DONE]
+        side.append("Replaces the table: the solution is cleared" + (f", and so are {', '.join(ran)}." if ran else "."))
+    if actor == "agent" and solution_signed(project):
+        checks.append(_check("Signed solution unchanged", False, "The owner signed this solution; new data would clear it, so only a person may replace the data."))
+    if int(project.get("holdout_uses", 0) or 0):
+        side.append("The holdout stays used: a new estimate on it will need a reason.")
+    return _verdict("attach_data", actor, frm, "WF-02", checks, ["DCLAB-R01"], [], side, args, ("Signed solution unchanged",))
+
+
+def _attach_labels(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    """A label file next to the table (15.2): it needs the table, and it changes the target, so a signed solution stays
+    a person's to change."""
+    checks = [_not_running(project), _check("A table is attached", bool(project.get("data")), "Attach the table before its labels.")]
+    if actor == "agent" and solution_signed(project):
+        checks.append(_check("Signed solution unchanged", False, "The owner signed this solution; new labels would clear it, so only a person may attach them."))
+    ran = [s for s in STAGE_KEYS if _stage_status(project, s) in DONE]
+    side = ["The labels define the target: the solution is cleared" + (f", and so are {', '.join(ran)}." if ran else ".")]
+    return _verdict("attach_labels", actor, frm, "WF-02", checks, ["DCLAB-R01"], [], side, args, ("Signed solution unchanged",))
+
+
+def _attach_table(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    """One more table beside the main one (16.15 C): it needs the main table; the solution stays, the stages are rerun."""
+    checks = [_not_running(project), _check("A table is attached", bool(project.get("data")), "Attach the main table before a related one.")]
+    ran = [s for s in STAGE_KEYS if _stage_status(project, s) in DONE]
+    side = [f"A machine may read it: {', '.join(ran)} cleared." if ran else "No stage has run yet."]
+    return _verdict("attach_table", actor, frm, "WF-02", checks, ["DCLAB-R09"], [], side, args)
+
+
+def _programme_read_before(project: dict[str, Any]) -> bool:
+    """Whether a programme of this project has already read the holdout (or the stages' final did): the project's count, and the stored programme itself."""
+    document = (project.get("programme") or {}).get("document") or {}
+    return int(project.get("holdout_uses", 0) or 0) > 0 or bool(document.get("holdout")) or bool(document.get("reads_before"))
+
+
+def _run_programme(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    """Run a problem of several parts (24.5): the leaves, the composition chosen on validation and, when nothing blocks, the one read of the holdout. The rules of the final
+    stage hold: the solution is signed when the policy asks, a second read of the holdout needs a person's written reason, an agent may not make it, and an agent needs the
+    owner's approval when the policy asks."""
+    pol = policy(project)
+    checks = [_check("A programme is planned", bool(project.get("programme_plan")), "This project was not built from a problem with several parts: there is no programme."),
+              _check("Data", bool(project.get("data")), "Attach a table first (WF-02)."), _not_running(project)]
+    if pol["require_solution_signoff"]:
+        checks.append(_check("Solution signed", plan_signed(project), "The owner must sign the plan of the programme before WF-04 (gate: solution)."))
+    side = ["Runs the leaves, chooses the composition on validation and reads the holdout once when every leaf has run; a blocked leaf keeps the holdout closed."]
+    evidence = ["PIT-006"]
+    if _programme_read_before(project):
+        reason = str(args.get("reuse_reason") or "").strip()
+        if actor == "agent":
+            checks.append(_check("Holdout unused", False, "The holdout was already read on this project. The intern may not run the programme again; choosing by the holdout score makes it optimistic (PIT-006)."))
+        else:
+            checks.append(_check("Holdout reuse confirmed", bool(reason), "The holdout was already read on this project. Running the programme again reads it a second time and makes the score "
+                                 "optimistic (PIT-006); confirm with a written reason."))
+            if reason:
+                side.append(f"A second programme on the same holdout, recorded with the reason: {reason[:200]}")
+    if pol["require_holdout_approval"] and actor == "agent":
+        approved = any(a.get("gate") == "holdout" and not a.get("used") for a in project.get("approvals", []))  # a programme judges no bar: no D3
+        checks.append(_check("Owner approval", approved, "The owner must approve opening the holdout (gate: holdout)."))
+    approval = ("Solution signed", "Owner approval") + (("Holdout reuse confirmed",) if actor == "human" else ())
+    return _verdict("run_programme", actor, frm, "WF-09", checks, list(NODE_BY_ID["WF-09"]["rules"]), evidence, side, args, approval)
+
+
+def _drop_leaf(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    """A person drops a leaf of the programme that cannot run (24.5). Only a person; never with an empty reason; never after the holdout was read, since dropping a part of
+    the problem once its answer is known would choose the problem by its answer."""
+    document = (project.get("programme") or {}).get("document")
+    checks = [_check("A programme has run", bool(document), "The programme has not run yet: there is no blocked leaf to drop."), _not_running(project),
+              _check("A person decides", actor == "human", "Only a person drops a leaf of a programme."),
+              _check("A reason", bool(str(args.get("reason") or "").strip()), "A dropped leaf needs the reason."),
+              _check("Holdout unread", not _programme_read_before(project), "The holdout was already read on this project: a leaf cannot be dropped after it.")]
+    return _verdict("drop_leaf", actor, frm, "WF-07", checks, ["DCLAB-R01"], ["PIT-006"], ["The composition goes on without the leaf, and the programme says so."], args)
+
+
+def _forbid_columns(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    """A person keeps columns out of every model of the project (28.5: the auditor's suspects, shown to them). Only a person; columns the tables hold; a reason. After
+    the holdout was read the columns still go out, and a new estimate on it needs a written reason, as any second read does."""
+    columns = [str(c) for c in args.get("columns") or []]
+    held = set((project.get("data") or {}).get("columns") or []) | {c.get("name") for t in ((project.get("data") or {}).get("card") or {}).get("tables") or []
+                                                                   for c in t.get("columns") or []}
+    checks = [_check("Data", bool(project.get("data")), "Attach a table before keeping its columns out."), _not_running(project),
+              _check("A person decides", actor == "human", "Only a person keeps a column out of the models."),
+              _check("Columns named", bool(columns), "Name the columns to keep out."),
+              _check("Columns held", all(c in held for c in columns), f"Not columns of the tables: {', '.join(c for c in columns if c not in held)[:300]}"),
+              _check("A reason", bool(str(args.get("reason") or "").strip()), "Say why the columns are kept out.")]
+    side = ["The stored programme and the stages that read these columns become stale."]
+    if _programme_read_before(project) or int(project.get("holdout_uses", 0) or 0):
+        side.append("The holdout stays used: a new estimate on it will need a reason.")
+    return _verdict("forbid_columns", actor, frm, "WF-05", checks, ["DCLAB-R04", "DCLAB-R05"], ["PIT-006"], side, args)
+
+
+def _set_brief(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    """30.14: a person writes the Solution Brief; never while a stage runs (the final reads it), never after the holdout was
+    read (a bar moved after the read would be chosen on it)."""
+    uses = int(project.get("holdout_uses", 0) or 0)
+    checks = [_check("A person writes it", actor == "human", "The Solution Brief is the owner's: an agent may draft one, a person saves it."),
+              _not_running(project),
+              _check("Holdout unused", not uses, f"The holdout was read {uses} time(s) against this brief: its bar cannot change now; a new "
+                                                 "bar needs a new holdout (a new project on later rows).")]
+    return _verdict("set_brief", actor, frm, None, checks, ["DCLAB-R01", "DCLAB-R17"], ["PIT-006"] if uses else [], [], args)
+
+
+def plan_fingerprint(project: dict[str, Any]) -> str | None:
+    return ((project.get("programme_plan") or {}).get("solution_map") or {}).get("fingerprint")
+
+
+def plan_signed(project: dict[str, Any]) -> bool:
+    """The plan of a programme is signed when the owner signed the gate 'solution' for the fingerprint of its solution map (a project with a saved solution signs that
+    solution instead, as for the stages)."""
+    if project.get("solution"):
+        return solution_signed(project)
+    fingerprint = plan_fingerprint(project)
+    return bool(fingerprint) and (project.get("signoff") or {}).get("solution_hash") == fingerprint
+
+
+def _set_settings(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    ran = [s for s in STAGE_KEYS if _stage_status(project, s) in DONE]
+    side = [f"Finished stages ({', '.join(ran)}) used the old rows; they apply the new setting only when rerun."] if ran else []
+    return _verdict("set_settings", actor, frm, "WF-03", [_not_running(project)], [], [], side, args)
+
+
+def _propose_solution(project: dict[str, Any], actor: str, frm: str | None, args: dict[str, Any]) -> Verdict:
+    checks = [_check("Data", bool(project.get("data")), "Attach a table before proposing a solution (WF-02).")]
+    return _verdict("propose_solution", actor, frm, "WF-01", checks, ["DCLAB-R01"], [], ["Saves a proposal only; the solution changes with set_solution."], args)
+
+
+# ---------------------------------------------------------------------- effects and the log
+
+
+def approve_gate(store: ProjectStore, project_id: str, gate: str, by: str = "owner", reason: str = "") -> dict[str, Any]:
+    """Record a person's approval of a gate (validated and logged like any move)."""
+    gate = LEGACY_GATES.get(gate, gate)
+    project = store.get(project_id)
+    verdict = check(project, "approve_gate", "human", gate=gate)
+    log(store, project_id, verdict, project)
+    if not verdict.allowed:
+        raise GraphBlocked(verdict)
+    entry = {"gate": gate, "by": by, "at": now(), "reason": reason[:500]}
+    from ..accounts.principal import current
+
+    person = current()
+    if person is not None and person.user_id:  # the approving user (package 10.2), beside the name shown
+        entry.update(user_id=person.user_id, role=person.role)
+    if gate == "solution":
+        entry["solution_hash"] = solution_hash(project["solution"]) if project.get("solution") else plan_fingerprint(project)  # a programme's plan is what is signed when no solution is
+        if project.get("brief") and not int(project.get("holdout_uses", 0) or 0):  # 30.14: the brief signed with the solution, its bar
+            from dclab_core.solution_brief import SolutionBrief, sign  # frozen at this signature; never signed after the holdout read
+
+            signed_brief = sign(SolutionBrief.read(project["brief"]), by=by or "owner", at=entry["at"])
+            project["brief"] = signed_brief.model_dump(mode="json")
+            entry["brief_hash"] = signed_brief.approval.fingerprint
+        elif project.get("brief"):
+            from dclab_core.solution_brief import SolutionBrief, fingerprint, signed
+
+            kept = SolutionBrief.read(project["brief"])
+            if signed(kept):
+                entry["brief_hash"] = fingerprint(kept)  # the bar the read was judged on, as it was signed
+        project["signoff"] = entry
+    project.setdefault("approvals", []).append(entry)
+    from . import memory
+    memory.gate_approved(project, gate, "human", reason)  # A5.2
+    store.save(project)
+    from .. import audit
+
+    audit.record_for(store, "approval", "human", (by or "owner").capitalize(), project=project, move="approve_gate", status="allowed",
+                     at=entry["at"], args={"gate": gate}, message=entry["reason"], rules=["DCLAB-R01"] if gate == "solution" else ["DCLAB-R17"],
+                     **({"solution_hash": entry["solution_hash"]} if "solution_hash" in entry else {}))
+    return project
+
+
+def capture(store: ProjectStore, project_id: str, actor: str = "human") -> Verdict:
+    """WF-10: an export after the final stage closes the loop; before it, the export is a draft and WF-10 stays open."""
+    project = store.get(project_id)
+    verdict = check(project, "capture", actor)
+    if not verdict.allowed:
+        log(store, project_id, verdict, project)
+        raise GraphBlocked(verdict)
+    before = json.loads(json.dumps(project, default=str))
+    if _stage_status(project, "final") in DONE and not project.get("captured"):
+        project["captured"] = now()
+        store.save(project)
+    log(store, project_id, verdict, before, outcome="done: notebook and report exported")
+    return verdict
+
+
+def consume_holdout_approval(project: dict[str, Any]) -> dict[str, Any] | None:
+    """Mark the oldest unused holdout approval used; returns it (the caller audits the use), or None."""
+    for approval in project.get("approvals", []):
+        if approval.get("gate") == "holdout" and not approval.get("used"):
+            approval["used"] = now()
+            return approval
+    return None
+
+
+def log(store: ProjectStore, project_id: str, verdict: Verdict, project: dict[str, Any] | None = None, outcome: str | None = None) -> dict[str, Any]:
+    """Append one transition: the state before, the proposed move, the verdict and (when it ran) the outcome."""
+    project = project or store.get(project_id)
+    entry = {
+        "at": now(), "actor": verdict.actor, "move": verdict.move, "args": verdict.args,
+        "from": verdict.node_from, "to": verdict.node_to, "state": state_string(project),
+        "status": verdict.status, "message": verdict.message,
+        "failed_checks": [c["name"] for c in verdict.checks if not c["ok"]],
+        "rules": verdict.rules, "evidence": verdict.evidence, "side_effects": verdict.side_effects,
+        # the stage and capture moves the graph allowed this actor at this state: what a policy model chooses among (A6.1)
+        "allowed": [m["move"] + (f":{m['stage']}" if m.get("stage") else "") for m in describe(project, verdict.actor)["moves"] if m["status"] == "allowed"],
+    }
+    if outcome:
+        entry["outcome"] = outcome
+    store.transition(project_id, entry)
+    if not (verdict.move == "approve_gate" and verdict.allowed):  # an allowed approval is audited with who, when and why below
+        from .. import audit
+
+        audit.record_for(store, "move", verdict.actor, project=project, move=verdict.move, status=verdict.status, at=entry["at"],
+                         args=verdict.args, message=verdict.message, outcome=outcome, rules=verdict.rules,
+                         failed_checks=entry["failed_checks"], **{"from": verdict.node_from, "to": verdict.node_to})
+    from ..ledger import capture  # 19.7: every move the validator checked, as a decision of the workflow
+
+    capture.move(verdict, entry, project, project_id)
+    return entry
+
+
+def describe(project: dict[str, Any], actor: str = "human") -> dict[str, Any]:
+    """Everything a UI or the intern needs: steps with their state, the current step, and what each move would do now."""
+    states = node_states(project)
+    moves = []
+    for stage in STAGE_KEYS:
+        v = check(project, "run_stage", actor, stage=stage)
+        moves.append({"move": "run_stage", "stage": stage, "to": v.node_to, "status": v.status, "message": v.message})
+    v = check(project, "capture", actor)
+    moves.append({"move": "capture", "to": "WF-10", "status": v.status, "message": v.message})
+    if project.get("programme_plan"):
+        v = check(project, "run_programme", actor)
+        moves.append({"move": "run_programme", "to": v.node_to, "status": v.status, "message": v.message})
+    return {
+        "nodes": [{**n, "state": states[n["id"]]} for n in NODES],
+        "current": current_node(project), "state": state_string(project), "policy": policy(project),
+        "revisits": [{"from": a, "to": b, "why": why} for (a, b), why in REVISITS.items()] + [{"from": "any", "to": "WF-01", "why": "reopen the solution"}],
+        "gates": [{"gate": g, "what": what, "required": policy(project)["require_solution_signoff" if g == "solution" else "require_holdout_approval"],
+                   "approved": (solution_signed(project) if g == "solution" else any(a.get("gate") == "holdout" and not a.get("used") for a in project.get("approvals", [])))}
+                  for g, what in GATES.items()],
+        "holdout_uses": int(project.get("holdout_uses", 0) or 0),
+        "moves": moves,
+    }

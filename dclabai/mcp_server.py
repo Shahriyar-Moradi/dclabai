@@ -1,0 +1,146 @@
+"""DCLab as an MCP server over HTTP, so any MCP client can drive the notebook.
+
+The tools are the intern's toolbox: the evidence index, the column auditor, the
+solution, the five deterministic stages, the notebook export. Hugging
+Face's Chat UI (and its ML Intern mode) connects to this endpoint through
+``MCP_SERVERS``; so can Claude Desktop, Cursor or any other MCP client.
+
+Served two ways:
+
+- mounted at ``/mcp`` by the notebook server (``make notebook`` → ``http://127.0.0.1:8765/mcp``)
+- standalone: ``python -m dclabai.mcp_server --port 8777`` → ``http://127.0.0.1:8777/mcp``
+
+The transport is streamable HTTP, stateless, JSON responses, so a plain POST of a
+JSON-RPC message works too. Deterministic code still owns every split, metric and
+selection rule; the client's model only proposes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+from dclabai.agentic.catalog import ROOT
+from dclabai.settings import default_home
+from dclabai.intern.tools import Toolbox
+from dclabai.studio import ProjectStore
+
+INSTRUCTIONS = (
+    "DCLab notebook tools. Build a model from a table with evidence: write the solution first "
+    "(propose_solution → set_solution), run the stages in order (run_stage or run_all), read each record before "
+    "the next step, cite the record IDs the notes give you (search_evidence / get_record), and never rerun the "
+    "final stage to chase a score: it consumes the holdout once. Research evidence is not production approval."
+)
+
+
+def build_server(toolbox: Toolbox):
+    """A low-level MCP server whose tool list is the registry's project tools (the intern's), read at each request."""
+    from mcp.server.lowlevel import Server
+    import mcp.types as types
+
+    server = Server("dclab", instructions=INSTRUCTIONS)
+
+    @server.list_tools()
+    async def list_tools() -> list[types.Tool]:
+        specs = [s["function"] for s in toolbox.schemas()]
+        return [types.Tool(name=spec["name"], description=spec["description"], inputSchema=spec["parameters"]) for spec in specs]
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent]:
+        from . import experience
+        from .agents import harness  # 21.1: each call of an MCP client is a run of the "mcp" agent, recorded even when it raises
+
+        project = (arguments or {}).get("project_id")
+        result: Any = None
+        error: str | None = None
+        run: str | None = None
+        try:
+            with experience.bind(project=project if isinstance(project, str) else None), harness.session("mcp") as current:
+                run = current.run_id
+                with current.timed(name, arguments or {}) as out:
+                    out["result"] = result = await asyncio.to_thread(toolbox.call, name, arguments or {})
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            _keep_call(toolbox, run, name, arguments or {}, result, error)  # 32.7: kept whether it worked or not
+        return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+
+    return server
+
+
+def _keep_call(toolbox: Toolbox, run: str | None, name: str, arguments: dict[str, Any], result: Any, error: str | None = None) -> None:
+    """32.7: an MCP client's call kept whole as its own source, ``<workspace>/mcp/calls.jsonl`` (the store's keepers keep it,
+    the keys that quote a table's cells removed). Never a reason for the call to fail."""
+    from datetime import datetime, timezone
+
+    try:
+        from .corrections import _home
+
+        home = _home()  # the workspace of the running services (its ledger's or its experience log's folder), on files or PostgreSQL
+        if home is None:
+            return
+        (Path(home) / "mcp").mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"at": datetime.now(timezone.utc).isoformat(timespec="microseconds"), "run": run, "tool": name,
+                           "arguments": arguments, "result": result, "error": error}, ensure_ascii=False, default=str)
+        with open(Path(home) / "mcp" / "calls.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def session_manager(toolbox: Toolbox, *, json_response: bool = True):
+    """One stateless streamable-HTTP manager; mount ``manager.handle_request`` and run ``manager.run()`` in the lifespan."""
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    return StreamableHTTPSessionManager(app=build_server(toolbox), json_response=json_response, stateless=True)
+
+
+def available() -> bool:
+    try:
+        import mcp  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def standalone_app(home: Path):
+    """A minimal Starlette app serving only ``/mcp`` (for clients that do not need the notebook UI)."""
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    store = ProjectStore(home)
+    store.audit_path = Path(home).parent / "audit.jsonl"  # the workspace's audit (10.4), as the notebook server's stores write it
+    manager = session_manager(Toolbox(store))
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with manager.run():
+            yield
+
+    return Starlette(routes=[Mount("/mcp", app=manager.handle_request)], lifespan=lifespan)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--port", type=int, default=int(os.environ.get("DCLAB_MCP_PORT", "8777")))
+    parser.add_argument("--home", type=Path, default=Path(os.environ.get("DCLAB_STUDIO_HOME") or default_home() / "projects"))
+    args = parser.parse_args(argv)
+    if not available():
+        print("The MCP server needs the optional package: pip install mcp", file=sys.stderr)
+        return 1
+    import uvicorn
+
+    print(f"DCLab MCP server on http://127.0.0.1:{args.port}/mcp (projects in {args.home})")
+    uvicorn.run(standalone_app(args.home), host="127.0.0.1", port=args.port)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

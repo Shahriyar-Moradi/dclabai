@@ -1,0 +1,734 @@
+DC.view('admin', {
+  init(el) {
+    const { $, esc, chip, toast } = DC;
+    const POL = [
+      ['The holdout opens once, after every choice is locked', 'DCLAB-R17', true, true],
+      ['Forbidden columns are blocked at the tool level', 'DCLAB-R04', true, true],
+      ['LLM critique is advisory; numbers come from code', 'DCLAB-R20', true, true],
+      ['A research result is never labelled production-ready', 'DCLAB-R22', true, true],
+      ['The solution must be signed before WF-04', 'DCLAB-R01', true, false],
+      ['Tuning needs a margin declared before the run', 'DCLAB-R16', true, false],
+      ['Ask the owner when a column\'s timing is unclear', 'DCLAB-R05', true, false],
+      ['Allow quick mode (row sampling) for exploration', '', true, false],
+      ['Let the intern run code in the sandbox', '', true, false],
+      ['Let the intern start GPU jobs under the cap without asking', '', false, false],
+    ];
+    $('#policy-list', el).innerHTML = POL.map(([t, r, on, locked], i) => `<div class="list-item"><label class="switch" data-style="flex:1"><input type="checkbox" data-pol="${i}" ${on ? 'checked' : ''} ${locked ? 'disabled' : ''}><span class="track"></span><span>${esc(t)}</span></label>${r ? chip(r) : ''}${locked ? '<span class="pill">locked</span>' : ''}</div>`).join('');
+    const ROLES = ['Owner', 'ML engineer', 'Reviewer', 'Business viewer', 'Intern'];
+    const ACT = [
+      ['Create a project', ['y', 'y', '-', '-', 'y']], ['Sign a solution', ['y', '-', '-', '-', '-']], ['Approve a stage', ['y', 'y', 'y', '-', 'a']],
+      ['Open the holdout', ['y', 'a', '-', '-', 'a']], ['Override the rule\'s pick (with a reason)', ['y', 'y', '-', '-', '-']], ['Approve a brief', ['y', '-', '-', 'y', '-']],
+      ['Start a GPU job over the cap', ['y', 'a', '-', '-', 'a']], ['Change policies', ['y', '-', '-', '-', '-']], ['See code and tool calls', ['y', 'y', 'y', '-', 'y']],
+    ];
+    const cell = v => `<td>${v === 'y' ? '<span class="yes">✓</span>' : v === 'a' ? '<span class="ask">asks</span>' : '<span class="no">—</span>'}</td>`;
+    $('#role-matrix', el).innerHTML = `<thead><tr><th>Action</th>${ROLES.map(r => `<th>${r}</th>`).join('')}</tr></thead><tbody>${ACT.map(([a, v]) => `<tr><td>${esc(a)}</td>${v.map(cell).join('')}</tr>`).join('')}</tbody>`;
+
+    /* Real mode: GET /api/platform/policies, /api/platform/limits, /api/intern and /api/platform/audit. */
+    const S = this.S = { real: false, offset: 0, limit: 50 };
+    $('#policy-list', el).addEventListener('change', async e => {
+      const box = e.target;
+      if (!S.real) { if (box.dataset.pol != null) toast('Sample policy list: nothing is saved.'); return; }
+      const { project, key } = box.dataset;
+      if (!project || !key) return;
+      box.disabled = true;
+      try {
+        await DC.client.patchProject(project, { body: { policy: { [key]: box.checked } } });
+        DC.currentProject.clear();
+        toast(`Saved on this project: the gate is now ${box.checked ? 'required' : 'off'}, and the change is in the audit log.`);
+        await this.loadPolicies(el);
+      } catch (err) { box.checked = !box.checked; box.disabled = false; toast(err.message, { ok: false }); }
+    });
+    el.addEventListener('click', e => {
+      const op = e.target.closest('[data-open-project]');
+      if (op) { DC.state.projectId = op.dataset.openProject; DC.state.project = 'p:' + op.dataset.openProject; DC.currentProject.clear(); }
+      const rd = e.target.closest('[data-resume-draft]');
+      if (rd) DC.state.resumeDraft = rd.dataset.resumeDraft;  // Home opens it (its enter)
+      const oj = e.target.closest('[data-open-job]');
+      if (oj) DC.state.jobId = oj.dataset.openJob;              // Compute & jobs selects it (its enter)
+    });
+    /* A6.4: shadow and serving changes go to POST /api/models/routing; the answer is the new summary */
+    const route = (body, headers) => DC.client.changeRouting({ body, headers: headers || {} })
+      .then(gw => { this.paintModels(el, {}, gw); toast('Saved. The routing history and the audit keep the change.'); return true; })
+      .catch(err => { toast(err.message, { ok: false }); return false; });
+    el.addEventListener('change', e => {
+      const sel = e.target.closest('[data-shadow]'); if (!sel) return;
+      route({ purpose: sel.dataset.shadow, setting: 'shadow', tier: sel.value || null });
+    });
+    el.addEventListener('click', e => {
+      const capped = e.target.closest('[data-cap-role]'); if (!capped) return;
+      const purpose = capped.dataset.capRole;
+      DC.modal.open({
+        eyebrow: '<span class="eyebrow">Roles and their models</span>', title: `Monthly cap for ${esc(purpose)}`, confirm: 'Set the cap',
+        html: '<label class="small" for="cap-eur">Euros a month (empty: no cap of its own)</label><input id="cap-eur" type="number" min="0" step="0.01">'
+          + '<label class="small" for="cap-reason">Reason (kept in the audit)</label><textarea id="cap-reason" rows="2"></textarea>'
+          + '<label class="row small"><input type="checkbox" id="cap-role"> I set this as the workspace\'s reviewer</label>'
+          + '<p class="xs muted">A cap counts euros: a model without a price is not stopped by it (its requests are counted, not priced).</p>',
+        onConfirm: () => {
+          if (!(document.getElementById('cap-role') || {}).checked) { toast('Only a reviewer sets a cap: tick the box.', { ok: false }); return false; }
+          const raw = (document.getElementById('cap-eur') || {}).value;
+          route({ purpose, setting: 'cap', cap_eur_month: raw === '' ? null : Number(raw), reason: (document.getElementById('cap-reason') || {}).value || '' },
+                { 'X-DCLab-Role': 'reviewer' }).then(ok => { if (ok) { DC.modal.close(); this.loadRoles(el); } });
+          return false;
+        },
+      });
+    });
+    el.addEventListener('click', e => {
+      const back = e.target.closest('[data-serve-back]');
+      if (back) { route({ purpose: back.dataset.serveBack, setting: 'serve', tier: null }); return; }
+      const tuned = e.target.closest('[data-serve-tuned]'); if (!tuned) return;
+      const purpose = tuned.dataset.serveTuned;
+      DC.modal.open({
+        eyebrow: '<span class="eyebrow">Models & routing</span>', title: `Serve ${esc(purpose)} with the tuned model?`, confirm: 'Move it',
+        html: '<p>Requests for this purpose will be answered by the tuned model. Moving it back is one click.</p>'
+          + '<label class="small" for="route-reason">Reason (kept in the audit)</label><textarea id="route-reason" rows="2" placeholder="What the shadow log showed"></textarea>'
+          + '<label class="row small"><input type="checkbox" id="route-role"> I approve this as the workspace\'s reviewer</label>'
+          + '<p class="xs muted">Until accounts exist, the role is the one you declare here.</p>',
+        onConfirm: () => {
+          if (!(document.getElementById('route-role') || {}).checked) { toast('Only a reviewer moves a purpose: tick the box.', { ok: false }); return false; }
+          route({ purpose, setting: 'serve', tier: 'tuned', reason: (document.getElementById('route-reason') || {}).value || '' }, { 'X-DCLab-Role': 'reviewer' })
+            .then(ok => { if (ok) DC.modal.close(); });  // on an error the reason stays typed in the dialog
+          return false;
+        },
+      });
+    });
+    $('#audit-newer', el).addEventListener('click', () => { S.offset = Math.max(0, S.offset - S.limit); this.loadAudit(el); });
+    ['kind', 'status', 'actor', 'project'].forEach(f => $(`#audit-${f}`, el).addEventListener('change', e => { S[f] = e.target.value; S.offset = 0; this.loadAudit(el); }));
+    DC.client.listProjects().then(list => {
+      const options = list.map(p => `<option value="${DC.esc(p.id)}">${DC.esc(p.name || p.id)}</option>`).join('');
+      $('#audit-project', el).insertAdjacentHTML('beforeend', options);
+      $('#sess-project', el).insertAdjacentHTML('beforeend', options);
+    }).catch(() => { /* the filters keep "Every project" */ });
+    $('#audit-older', el).addEventListener('click', () => { S.offset += S.limit; this.loadAudit(el); });
+    /* 19.4: the record of every session. Find narrows the list; a row opens its timeline below. */
+    $('#sess-find', el).addEventListener('submit', e => { e.preventDefault(); this.loadSessions(el); });
+    $('#sess-clear', el).addEventListener('click', () => { $('#sess-find', el).reset(); this.loadSessions(el); });
+    $('#sess-close', el).addEventListener('click', () => { $('#sess-one', el).hidden = true; S.visit = null; });
+    $('#sess-model-text', el).addEventListener('change', () => { if (S.visit) this.openSession(el, S.visit); });
+    /* 19.10: a session and everything it left, deleted; the audit keeps only that it was. A second click confirms. */
+    $('#sess-delete', el).addEventListener('click', async e => {
+      const btn = e.currentTarget;
+      if (!S.visit) return;
+      if (btn.dataset.armed !== S.visit) { btn.dataset.armed = S.visit; btn.textContent = 'Delete for good?'; return; }
+      try { await DC.client.deleteSession(S.visit); DC.toast('Deleted. The audit log keeps that it was, never what it held.'); }
+      catch (err) { DC.toast(err.message, { ok: false }); return; }
+      finally { delete btn.dataset.armed; btn.textContent = 'Delete session'; }
+      $('#sess-one', el).hidden = true; S.visit = null; this.loadSessions(el);
+    });
+    $('#sess-body', el).addEventListener('click', e => {
+      const row = e.target.closest('[data-visit]');
+      if (row && !e.target.closest('a')) this.openSession(el, row.dataset.visit);
+    });
+    $('#sess-body', el).addEventListener('keydown', e => {
+      const row = e.target.closest('[data-visit]');
+      if (row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); this.openSession(el, row.dataset.visit); }
+    });
+    /* Members and API tokens (package 10.2, part C) */
+    $('#member-add', el).addEventListener('submit', async e => {
+      e.preventDefault();
+      const own = $('#member-own', el).checked;
+      const body = { username: $('#member-username', el).value, email: $('#member-email', el).value, name: $('#member-name', el).value, role: $('#member-role', el).value, own_workspace: own };
+      if (!$('#member-secret', el).hidden && $('#member-secret', el).value) body.password = $('#member-secret', el).value;
+      try {
+        const added = await DC.client.addMember({ body });
+        toast(own ? `Added, with their own workspace “${added.workspace}”. The change is in the audit log.` : 'Added. The change is in the audit log.');
+        e.target.reset(); $('#member-role', el).disabled = $('#member-own', el).checked; await this.loadMembers(el);
+      }
+      catch (err) { toast(err.message, { ok: false }); }
+    });
+    $('#member-own', el).addEventListener('change', e => { $('#member-role', el).disabled = e.target.checked; });  // in their own workspace they are its owner
+    el.addEventListener('change', async e => {
+      const sel = e.target.closest('[data-member-role]'); if (!sel) return;
+      try { await DC.client.changeMember(sel.dataset.memberRole, { body: { role: sel.value } }); toast('Role changed. The change is in the audit log.'); }
+      catch (err) { toast(err.message, { ok: false }); }
+      await this.loadMembers(el);
+    });
+    $('#token-add', el).addEventListener('submit', async e => {
+      e.preventDefault();
+      let made;
+      try { made = await DC.client.newToken({ body: { name: $('#token-name', el).value } }); } catch (err) { toast(err.message, { ok: false }); return; }
+      e.target.reset();
+      DC.modal.open({
+        eyebrow: '<span class="eyebrow">API token</span>', title: `${made.name}: copy it now`, confirm: 'Copy and close',  // the title is set as text
+        html: `<p>${DC.esc(made.note)}</p><pre class="term" data-style="white-space:pre-wrap;overflow-wrap:anywhere">${DC.esc(made.token)}</pre><p class="xs muted">MCP clients send it as <code>Authorization: Bearer …</code> to /mcp.</p>`,
+        onConfirm: () => { DC.copyText(made.token); },
+      });
+      await this.loadTokens(el);
+    });
+    el.addEventListener('click', async e => {
+      const save = e.target.closest('[data-member-budget-save]');
+      if (save) {  // 25.10: one person's monthly model budget, the owner's; audited and in the session record
+        const id = save.dataset.memberBudgetSave, value = Number($(`[data-member-budget="${id}"]`, el).value);
+        try { await DC.client.setMemberBudget(id, { body: { monthly_eur: value } }); toast(`Saved: €${value.toFixed(2)} a month. The change is in the audit log.`); }
+        catch (err) { toast(err.message, { ok: false }); }
+        return;
+      }
+      const out = e.target.closest('[data-member-remove]');
+      if (out) {
+        try { await DC.client.removeMember(out.dataset.memberRemove); toast('Removed: their sessions and tokens in this workspace ended.'); }
+        catch (err) { toast(err.message, { ok: false }); }
+        await this.loadMembers(el);
+        return;
+      }
+      const revoke = e.target.closest('[data-token-revoke]');
+      if (revoke) {
+        try { await DC.client.revokeToken(revoke.dataset.tokenRevoke); toast('Revoked.'); }
+        catch (err) { toast(err.message, { ok: false }); }
+        await this.loadTokens(el);
+      }
+    });
+    DC.hydrate(el);
+  },
+
+  async enter(el) {
+    const [pol, lim, intern, gw] = await Promise.allSettled([DC.client.platformPolicies(), DC.client.platformLimits(), DC.client.internStatus(), DC.client.modelOverview()]);
+    if (pol.status !== 'fulfilled') { DC.markSample(true); return; }
+    this.S.real = true;
+    DC.markSample(false);
+    this.paintPolicies(el, pol.value);
+    if (lim.status === 'fulfilled') this.paintLimits(el, lim.value);
+    if (intern.status === 'fulfilled') this.paintModels(el, intern.value, gw.status === 'fulfilled' ? gw.value : null);
+    this.paintStats(el, pol.value, lim.status === 'fulfilled' ? lim.value : null, intern.status === 'fulfilled' ? intern.value : null);
+    this.S.offset = 0;
+    await Promise.all([this.loadRoles(el), this.loadAudit(el), this.loadMembers(el), this.loadTokens(el), this.loadLimits(el), this.loadSessions(el), this.loadErrors(el), this.loadDecisions(el), this.loadAgents(el),
+    ]);
+  },
+
+
+  // 29.1: the students' register: a decision model behind every choice, and how far each is trusted
+  // the agents' scorecard: the metrics ledger, per agent and per suite
+  async loadAgents(el) {
+    const { $, esc } = DC;
+    let r;
+    try { r = await DC.client.agentScorecard({ quiet: true }); } catch (e) { DC.states.failed($('#ag-body', el), e, { retry: () => this.loadAgents(el), cols: 10 }); return; }
+    const n = v => Number(v || 0).toLocaleString('en-US');
+    const rate = m => (m ? `${(m.rate * 100).toFixed(m.rate < 0.1 || m.rate > 0.9 ? 1 : 0)}% <span class="muted xs">${n(m.n)} · ${(m.interval[0] * 100).toFixed(0)}–${(m.interval[1] * 100).toFixed(0)}</span>` : '—');
+    const agents = r.agents || [], suites = r.suites || [];
+    $('#ag-stats', el).innerHTML = [[agents.length, 'agents with measurements'], [n(agents.reduce((a, x) => a + x.requests, 0)), 'model requests recorded'],
+      [suites.length, 'evaluation suites'], [n(r.rows), 'measurements in the ledger']].map(([v, l]) => `<div class="stat"><span class="v">${esc(String(v))}</span><span class="l">${esc(l)}</span></div>`).join('');
+    $('#ag-body', el).innerHTML = agents.length ? agents.map(a => `<tr><td><b>${esc(a.agent)}</b><div class="cell-sub">${esc(Object.keys(a.models).join(', ') || '')}</div></td><td class="num mono">${n(a.requests)}</td>`
+      + `<td class="num">${rate(a.rates.request_ok)}</td><td class="num">${rate(a.rates.output_check)}</td><td class="num">${rate(a.rates.step_ok)}</td><td class="num">${rate(a.rates.proposal_accepted)}</td><td class="num">${rate(a.rates.feedback_helpful)}</td>`
+      + `<td class="num mono">${a.p50_seconds == null ? '—' : a.p50_seconds + ' · ' + a.p95_seconds}</td><td class="num mono">${a.eur}</td>`
+      + `<td class="mono xs">${Object.entries(a.prompts).map(([h, c]) => `${esc(h.slice(0, 8))}×${n(c)}`).join(' ') || '—'}</td></tr>`).join('')
+      : '<tr><td colspan="10"><div class="empty">Nothing measured yet: agents write here as they work (requests, steps, checks, proposals, ratings).</div></td></tr>';
+    $('#ag-note', el).textContent = r.note || '';
+    $('#ag-suites', el).innerHTML = suites.length ? suites.map(s => `<tr><td><b>${esc(s.suite)}</b></td><td class="num mono">${n(s.runs)}</td><td class="num mono">${n(s.passed)}</td><td class="mono">${esc(s.latest.ref)}</td><td class="mono xs">${esc(String(s.latest.at || '').slice(0, 10))}</td>`
+      + `<td><span class="pill ${s.latest.pass === true ? 'ok' : s.latest.pass === false ? 'bad' : 'outline'}">${s.latest.pass === true ? 'pass' : s.latest.pass === false ? 'not passed' : 'no verdict'}</span></td><td class="num mono">${s.latest.spent_eur == null ? '—' : s.latest.spent_eur}</td></tr>`).join('')
+      : '<tr><td colspan="7"><div class="empty">No evaluation result files found.</div></td></tr>';
+  },
+
+  // 19.13: the catalog of the datasets, and the sessions each came from
+  async loadRoles(el) {
+    /* 21.4: each role's model, prompt version, score by model and cost, one table */
+    const { $, esc } = DC;
+    const box = $('#roles-body', el);
+    let data;
+    try { data = await DC.client.modelRoles({ quiet: true }); } catch (err) { DC.states.failed(box, err, { retry: () => this.loadRoles(el) }); return; }
+    const eur = v => v == null ? '—' : '€' + Number(v).toFixed(v < 1 ? 4 : 2);
+    const rows = (data.roles || []).map(r => {
+      const spent = (r.spent_this_month || []).map(s => `${esc(s.model || '?')} ${s.unpriced ? `${s.requests} unpriced` : eur(s.eur)}`).join('<br>') || '<span class="muted">none</span>';
+      const scores = (r.measured || []).map(m => `${esc(m.model || 'rules')}: ${m.right}/${m.of} (${esc(m.split)})`).join('<br>') || '<span class="muted">not measured</span>';
+      const on = r.kind === 'agent' ? '<span class="xs muted">agent</span>' : `<span class="pill ${r.on ? 'ok' : 'outline'}" title="${esc(r.why || '')}">${r.on ? 'asked' : 'off'}</span>`;
+      return `<tr><td class="mono small">${esc(r.role)}${r.understanding ? ' <span class="xs muted">understanding</span>' : ''}</td>`
+        + `<td>${esc(r.serving_tier)}${r.serving_tier !== r.own_tier ? ` <span class="pill warn">moved from ${esc(r.own_tier)}</span>` : ''}<div class="mono xs muted">${esc(r.model || 'no model')}</div></td>`
+        + `<td class="mono xs">${esc(r.prompt || '—')}</td><td class="small">${scores}</td><td class="small">${spent}</td>`
+        + `<td>${eur(r.cap_eur_month)} <button type="button" class="link-btn small" data-cap-role="${esc(r.role)}">Set…</button></td><td>${on}</td></tr>`;
+    }).join('');
+    box.innerHTML = rows ? `<div class="table-wrap"><table class="data compact"><thead><tr><th>Role</th><th>Served by</th><th>Prompt</th><th>Measured</th><th>This month</th><th>Cap a month</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+      <span class="xs muted">Another model serves an understanding role only when it measured better than its own tier's model on the same conversations at this prompt (python -m dclabai.agent_eval.conversation --arm reader --model NAME; today the written dev conversations, and the conversation reader only), or the owner overrides with a reason. Every change, a cap included, is one audited change. A cap counts euros: an unpriced model is not stopped by it. A model changed in .env is not a routing change and is not checked here.</span>`
+      : '<div class="empty">No roles.</div>';
+  },
+
+
+  async loadDecisions(el) {
+    const { $, esc } = DC;
+    let r;
+    try { r = await DC.client.ledgerSummary({ quiet: true }); } catch (e) { DC.states.failed($('#dec-body', el), e, { retry: () => this.loadDecisions(el), cols: 2 }); return; }
+    const n = v => Number(v || 0).toLocaleString('en-US');
+    $('#dec-stats', el).innerHTML = [[n(r.decisions), `decisions recorded · ${n((r.by_kind || {}).technical)} technical, ${n((r.by_kind || {}).workflow)} workflow`],
+      [n(r.labels), 'labels · ' + (Object.entries(r.by_source || {}).map(([k, v]) => `${n(v)} ${k.replace(/_/g, ' ')}`).join(', ') || 'none yet')],
+      [n(r.drawn), 'drawn for a blind label'], [n((r.by_used || {}).person), 'decided by a person']]
+      .map(([v, l]) => `<div class="stat"><span class="v">${esc(v)}</span><span class="l">${esc(l)}</span></div>`).join('');
+    const points = Object.entries(r.by_point || {});
+    const oc = r.outcomes || {};
+    if (points.length) $('#dec-body', el).innerHTML = points.map(([p, c]) => { const o = oc[p] || {}; return `<tr><td class="mono small">${esc(p)}</td><td class="mono small">${n(c)}</td>`
+      + `<td class="mono small">${n(o.well)}</td><td class="mono small">${n(o.badly)}</td><td class="mono small">${n((o.none || 0) + (o.unknown || 0))}</td></tr>`; }).join('');
+    else DC.states.empty($('#dec-body', el), 'No decision recorded yet: they appear as DCLab works on drafts and projects.', { cols: 5 });
+    const shadows = Object.entries(r.shadow || {});
+    const pct = v => (v === null || v === undefined) ? '—' : `${Math.round(v * 100)}%`;
+    if (shadows.length) $('#shadow-body', el).innerHTML = shadows.map(([name, s]) => `<tr><td class="mono small">${esc(name)}</td><td>${esc(s.gate || '—')}</td>`
+      + `<td class="mono small">${n(s.decisions)}</td><td class="mono small">${pct(s.agreement)}</td><td class="mono small">${n(s.disagree)}</td>`
+      + `<td class="mono small">${pct(s.accuracy_on_disagreements)} of ${n(s.labelled_disagreements)} labelled</td></tr>`).join('');
+    else DC.states.empty($('#shadow-body', el), 'No classifier answers in shadow on this machine (make decision-models fits them).', { cols: 6 });
+    await this.loadBlind(el);
+    await this.loadQueue(el);
+  },
+
+  // 29.8: the disagreements worth a person's look, one click each; the next one is already here, nothing reloads
+  async loadQueue(el, keep) {
+    const { $, esc } = DC;
+    const box = $('#queue-body', el), pick = $('#queue-point', el);
+    this.queueSkipped = this.queueSkipped || [];
+    this.queueDone = this.queueDone || 0;
+    const point = pick.value || undefined;
+    const orderPick = $('#queue-order', el), order = orderPick ? orderPick.value : 'fair';  // 29.11
+    const sub = $('#queue-sub', el);
+    if (sub) sub.textContent = order === 'teach'
+      ? 'Decisions outside the fair sample, the student\'s least sure answers and others drawn at random, in turn; shown blind. These labels train the students and never count toward one acting (measured on invented tables: not passed).'
+      : 'Where a point\'s student disagrees with the rule, shown blind (you never see who said what) and in a random order, so whatever part you label is a fair sample. Each label counts toward that student\'s "needed to act".';
+    if (orderPick && !orderPick.dataset.wired) { orderPick.dataset.wired = '1'; orderPick.addEventListener('change', () => { this.queueSkipped = []; this.loadQueue(el); }); }
+    let r;
+    try { r = await DC.client.ledgerQueue({ query: { ...(point ? { point } : {}), limit: 30, order, ...(this.queueSkipped.length ? { skip: this.queueSkipped.join(',') } : {}) }, quiet: true }); }
+    catch (e) { DC.states.failed(box, e, { retry: () => this.loadQueue(el) }); return; }
+    const counts = r.points || {};
+    if (!keep) {
+      pick.innerHTML = '<option value="">every point</option>' + Object.entries(counts).map(([p, n]) => `<option value="${esc(p)}">${esc(p)} (${esc(String(n))})</option>`).join('');
+      if (point && counts[point] !== undefined) pick.value = point;
+      if (!pick.dataset.wired) { pick.dataset.wired = '1'; pick.addEventListener('change', () => this.loadQueue(el, true)); }
+    }
+    this.queueItems = r.items || [];
+    this.drawQueue(el);
+  },
+
+  drawQueue(el) {
+    const { $, esc } = DC;
+    const box = $('#queue-body', el);
+    const item = (this.queueItems || [])[0];
+    if (!item) {
+      DC.states.empty(box, this.queueDone ? `Labelled ${this.queueDone} here. No disagreement left to label at this point.` : 'No disagreement waiting: no student disagrees with the rule on a drawn decision yet.');
+      return;
+    }
+    const state = Object.entries(item.state || {}).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd class="mono small">${esc(Array.isArray(v) ? v.join(', ') : String(v))}</dd>`).join('');
+    box.innerHTML = `<div><b>${esc(item.question)}</b><div class="xs muted">${esc(item.point)} · about the ${esc(item.subject.kind)} <code>${esc(item.subject.key)}</code> · ${item.taught ? 'chosen to teach: it trains, never counts toward acting' : 'weight ' + esc(String(item.weight))}`
+      + ` · ${esc(String(this.queueItems.length))} in this batch${this.queueDone ? ` · ${esc(String(this.queueDone))} labelled` : ''}</div></div>`
+      + (state ? `<dl class="kv">${state}</dl>` : '<div class="xs muted">No state was recorded for this decision.</div>')
+      + `<div class="row" data-style="flex-wrap:wrap;gap:6px">${(item.options || []).map(o => `<button type="button" class="btn sm" data-q="${esc(o)}">${esc(o)}</button>`).join('')}`
+      + `<button type="button" class="btn sm ghost" data-q-skip title="Leave it unlabelled: a gap is reported, a guess is not">Can't tell — next</button></div>`;
+    const next = () => { this.queueItems.shift(); if (this.queueItems.length) this.drawQueue(el); else this.loadQueue(el, true); };
+    // a second click of a double click lands on the next decision's button: clicks this soon after drawing are ignored
+    const drawnAt = performance.now();
+    const read = ev => ev.detail <= 1 && performance.now() - drawnAt > 350;
+    $('[data-q-skip]', box).addEventListener('click', ev => { if (!read(ev)) return; this.queueSkipped.push(item.record); next(); });
+    box.querySelectorAll('[data-q]').forEach(b => b.addEventListener('click', async ev => {
+      if (!read(ev)) return;
+      box.querySelectorAll('button').forEach(x => { x.disabled = true; });
+      const raw = b.dataset.q;
+      const value = item.answer === 'noul' ? raw === 'yes' : raw;
+      try { await DC.client.ledgerBlindLabel(item.record, { body: { value, ...(item.taught ? { taught: true } : {}) } }); this.queueDone += 1; next(); }
+      catch (e) { DC.toast(e.message, { ok: false }); box.querySelectorAll('button').forEach(x => { x.disabled = false; }); }
+    }));
+    DC.hydrate(el);
+  },
+
+  async loadBlind(el) {
+    const { $, esc } = DC;
+    const box = $('#blind-body', el);
+    let r;
+    this.blindSkipped = this.blindSkipped || [];
+    const query = this.blindSkipped.length ? { skip: this.blindSkipped.join(',') } : {};
+    try { r = await DC.client.ledgerBlindNext({ query, quiet: true }); } catch (e) { DC.states.failed(box, e, { retry: () => this.loadBlind(el) }); return; }
+    const item = r.item;
+    if (!item) { DC.states.empty(box, 'Nothing to label: every decision drawn so far has its blind label.'); return; }
+    const state = Object.entries(item.state || {}).map(([k, v]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd class="mono small">${esc(Array.isArray(v) ? v.join(', ') : String(v))}</dd>`).join('');
+    box.innerHTML = `<div><b>${esc(item.question)}</b><div class="xs muted">About the ${esc(item.subject.kind)} <code>${esc(item.subject.key)}</code> · weight ${esc(String(item.weight))}</div></div>`
+      + (state ? `<dl class="kv">${state}</dl>` : '<div class="xs muted">No state was recorded for this decision.</div>')
+      + `<div class="row" data-style="flex-wrap:wrap;gap:6px">${(item.options || []).map(o => `<button type="button" class="btn sm" data-blind="${esc(o)}">${esc(o)}</button>`).join('')}`
+      + `<button type="button" class="btn sm ghost" data-blind-skip title="Leave it unlabelled: a gap is reported, a guess is not">Can't tell — next</button></div>`;
+    $('[data-blind-skip]', box).addEventListener('click', () => { this.blindSkipped.push(item.record); this.loadBlind(el); });
+    box.querySelectorAll('[data-blind]').forEach(b => b.addEventListener('click', async () => {
+      const raw = b.dataset.blind;
+      const value = item.answer === 'noul' ? raw === 'yes' : raw;
+      try { await DC.client.ledgerBlindLabel(item.record, { body: { value } }); DC.toast('Labelled, blind.'); await this.loadDecisions(el); }
+      catch (e) { DC.toast(e.message, { ok: false }); }
+    }));
+    DC.hydrate(el);
+  },
+
+  sessQuery(el) {
+    const { $ } = DC;
+    const q = {};
+    const v = id => $(id, el).value.trim();
+    if (v('#sess-kind')) q.kind = v('#sess-kind');
+    if (v('#sess-project')) q.project = v('#sess-project');
+    if (v('#sess-person')) q.person = v('#sess-person');
+    if (v('#sess-draft')) q.draft = v('#sess-draft');
+    if (v('#sess-request')) q.request = v('#sess-request');
+    if (v('#sess-text')) q.text = v('#sess-text');
+    if (v('#sess-code')) q.code = v('#sess-code');
+    // the days are the viewer's own (the times shown are local): local midnight, sent in UTC with its offset written out
+    const midnight = (day, plus) => { const d = new Date(day + 'T00:00:00'); d.setDate(d.getDate() + plus); return d.toISOString().replace('Z', '+00:00'); };
+    if (v('#sess-since')) q.since = midnight(v('#sess-since'), 0);
+    if (v('#sess-until')) q.until = midnight(v('#sess-until'), 1);  // the last day included
+    return q;
+  },
+
+  async loadErrors(el) {
+    const { $, esc } = DC;
+    const body = $('#err-body', el);
+    if (!body) return;
+    DC.states.loading(body, { cols: 7 });
+    let r;
+    try { r = await DC.client.experienceErrors({ query: { days: 30 }, quiet: true }); } catch (e) { DC.states.failed(body, e, { cols: 7, retry: () => this.loadErrors(el) }); return; }
+    if (!r.groups.length) { DC.states.empty(body, 'No error in the last 30 days.', { cols: 7 }); return; }
+    body.innerHTML = r.groups.map(g => `<tr><td class="mono small">${esc(g.fingerprint)}</td><td>${esc(String(g.count))}</td><td>${esc(g.codes.join(', '))}</td>`
+      + `<td>${esc(g.where.join(', '))}</td><td class="mono small">${esc(g.frame || '')}</td><td>${esc((g.last || '').slice(0, 16).replace('T', ' '))}</td>`
+      + `<td class="mono small">${g.requests.map(x => esc(x)).join('<br>')}</td></tr>`).join('');
+  },
+
+  async loadSessions(el) {
+    const { $, esc } = DC;
+    const q = this.sessQuery(el);
+    const searching = Object.keys(q).length > 0;
+    const body = $('#sess-body', el);
+    DC.states.loading(body, { cols: 6 });
+    let r, found = null;
+    try {
+      if (searching) { found = await DC.client.experienceSearch({ query: { ...q, limit: q.request ? 200 : 100 }, quiet: true }); }
+      r = await DC.client.experienceSessions({ query: { limit: 50 }, quiet: true });
+    } catch (e) { DC.states.failed(body, e, { retry: () => this.loadSessions(el), cols: 6 }); return; }
+    if (!this.S.sessKinds) {
+      this.S.sessKinds = true;
+      const fam = r.families.map(f => `<option value="${esc(f)}">Any ${esc(f)} event</option>`).join('');
+      const kinds = r.kinds.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('');
+      $('#sess-kind', el).insertAdjacentHTML('beforeend', `<optgroup label="Families">${fam}</optgroup><optgroup label="Kinds">${kinds}</optgroup>`);
+      DC.config().then(cfg => (cfg.auth || {}).mode === 'none' || !(cfg.auth || {}).signed_in ? [] : DC.client.members({ quiet: true })).then(m => {
+        const people = (m && (m.items || m.members)) || (Array.isArray(m) ? m : []);
+        const named = people.filter(p => p.user_id || p.id);
+        if (!named.length) return;  // one local owner: nobody to choose
+        $('#sess-person', el).insertAdjacentHTML('beforeend', named.map(p => `<option value="${esc(p.user_id || p.id)}">${esc(p.name || 'A member')}</option>`).join(''));
+        $('#sess-person', el).hidden = false;
+      }).catch(() => { /* accounts off */ });
+    }
+    const t = r.totals;
+    const eur = Object.entries(t.cost).map(([c, v]) => (c === 'EUR' ? '€' : c + ' ') + Number(v).toFixed(4)).join(' · ') || '€0';
+    $('#sess-stats', el).innerHTML = [[t.sessions, `latest session${t.sessions === 1 ? '' : 's'} · ${t.built} built or ran`], [t.flagged || 0, 'flagged by a failure detector'], [t.refused, `refused by a check · ${t.errors || 0} error${t.errors === 1 ? '' : 's'}`], [eur, 'model spend in them']]
+      .map(([v, l]) => `<div class="stat"><span class="v">${esc(String(v))}</span><span class="l">${esc(l)}</span></div>`).join('');
+    $('#sess-clear', el).hidden = !searching;
+    const foundBox = $('#sess-found', el);
+    foundBox.hidden = !searching;
+    if (found) {
+      foundBox.innerHTML = `<b>${found.total}</b> matching event${found.total === 1 ? '' : 's'} in <b>${found.visits}</b> session${found.visits === 1 ? '' : 's'}${found.capped ? ` · read the newest ${found.scanned.toLocaleString()} events only: narrow the dates to see older ones` : ''}.`
+        + (found.events.length ? `<div class="stack tight" data-style="margin-top:8px">${found.events.slice(0, q.request ? 200 : 12).map(e => `<div class="row"><span class="mono xs">${esc(this.when(e.at))}</span> ${this.what(e)}</div>`).join('')}</div>` : '');
+    }
+    const cards = found ? found.sessions : r.items;
+    if (!cards.length) {
+      DC.states.empty(body, searching ? 'No session matches.' : r.recording ? 'Nothing recorded yet: a session appears with its first action (a draft, an upload, a run).' : 'This server keeps no record of sessions.', { cols: 6 });
+      return;
+    }
+    const outcome = { open: '<span class="pill outline">open</span>', built: '<span class="pill">built</span>', ran: '<span class="pill">ran</span>', finished: '<span class="pill ok">finished</span>' };
+    body.innerHTML = cards.map(c => {
+      const spend = Object.entries(c.cost).map(([k, v]) => (k === 'EUR' ? '€' : k + ' ') + Number(v).toFixed(4)).join(' · ') || '—';
+      const problem = c.problem ? esc(c.problem.length > 90 ? c.problem.slice(0, 90) + '…' : c.problem) : '<span class="muted">no problem written</span>';
+      const fam = c.family ? ` <span class="pill outline">${esc(c.family.replace(/_/g, ' '))}</span>` : c.kind ? ` <span class="pill outline">${esc(c.kind)}</span>` : '';
+      const flagged = (c.flags || []).length ? `<span class="pill bad" title="${esc(c.flags.map(f => f.message).join(' · '))}">${c.flags.length} flag${c.flags.length === 1 ? '' : 's'}</span> ` : '';
+      const checks = `${flagged}${c.refused ? `<span class="pill warn">${c.refused} refused</span> ` : ''}${c.errors ? `<span class="pill bad">${c.errors} error${c.errors === 1 ? '' : 's'}</span>` : ''}` || '<span class="muted">—</span>';
+      return `<tr data-visit="${esc(c.visit)}" tabindex="0" data-style="cursor:pointer"><td class="mono small" data-style="white-space:nowrap">${esc(this.when(c.started))}</td><td>${esc(c.who || 'A member')}</td><td class="small">${problem}${fam}<div class="xs muted">${c.events} events · ${c.person_turns} messages from people · ${c.agent_turns} answers from agents</div></td><td>${outcome[c.outcome] || esc(c.outcome)}</td><td>${checks}</td><td class="mono small">${esc(spend)}</td></tr>`;
+    }).join('');
+    DC.hydrate(el);
+  },
+
+  when(s) { const t = new Date(s); return isNaN(t) ? String(s || '') : t.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }); },
+
+  what(e) {
+    const { esc } = DC;
+    const p = e.payload || {};
+    const code = v => v == null || v === '' ? '' : `<code>${esc(Array.isArray(v) ? v.join(', ') : String(v))}</code>`;
+    const quote = v => v ? `<div class="xs muted">${esc(String(v).length > 400 ? String(v).slice(0, 400) + '…' : String(v))}</div>` : '';
+    const no = '<span class="pill bad">refused</span>';
+    const words = {
+      'visit.started': () => 'Opened DCLab' + (p.surface ? ' · ' + esc(p.surface) : ''),
+      'chat.person': () => 'Wrote' + quote(p.text),
+      'chat.agent': () => 'Answered' + (p.question_field ? ' · asked about ' + code(p.question_field) : '') + quote(p.text),
+      'draft.created': () => 'Started a draft' + (p.pack ? ' · ' + code(p.pack) : '') + quote(p.problem),
+      'draft.edited': () => 'Changed ' + code(p.field) + (p.after != null ? ' to ' + code(p.after) : ''),
+      'draft.built': () => 'Built the project ' + code(p.project),
+      'draft.refused': () => `Build ${no} ${code(p.rule)}` + quote(p.reason),
+      'data.uploaded': () => 'Brought a table ' + code(p.name) + (p.rows != null ? ` · ${Number(p.rows).toLocaleString()} rows` : ''),
+      'solution.saved': () => 'Saved the solution · target ' + code(p.target) + (p.task ? ' · ' + code(p.task) : ''),
+      'solution.refused': () => `Solution ${no} ${code(p.rule)}` + quote(p.reason),
+      'stage.started': () => 'Started stage ' + code(p.stage),
+      'stage.finished': () => 'Finished stage ' + code(p.stage) + (p.metric ? ` · ${esc(p.metric)} ${p.value != null ? Number(p.value).toFixed(3) : ''}` : ''),
+      'stage.failed': () => `Stage ${code(p.stage)} <span class="pill bad">failed</span> ${code(p.code)}` + quote(p.error),
+      'graph.move': () => `Move ${code(p.move)}${p.allowed === false ? ' ' + no + ' ' + code(p.rules) : ''}`,
+      'agent.step': () => `${esc(p.agent || 'Agent')} step ${p.n ?? ''}${p.tool ? ' · ' + code(p.tool) : ''}` + quote(p.reply),
+      'tool.call': () => `Tool ${code(p.tool)}${p.verdict === 'denied' ? ' ' + no : ''}${p.code ? ' ' + code(p.code) : ''}`,
+      'model.request': () => `Model ${code(p.purpose)} · ${esc(p.model || '')}${p.cost != null ? ` · ${(p.currency || '').toUpperCase() === 'EUR' ? '€' : esc(p.currency || '') + ' '}${Number(p.cost).toFixed(5)}` : ''}` + quote(p.prompt) + quote(p.reply),
+      'decision.overridden': () => `Overrode ${code(p.point)}: ${code(p.proposed)} → ${code(p.chosen)}` + quote(p.reason),
+      'decision.refused': () => `Decision ${code(p.point)} ${no} ${code(p.rule)}` + quote(p.reason),
+      'job.started': () => 'Job started ' + code(p.kind),
+      'job.stopped': () => 'Job ' + code(p.kind) + ' ended ' + code(p.status),
+      'error.raised': () => `<span class="pill bad">error</span> ${code(p.code)} at ${code(p.where)}` + quote(p.message),
+    }[e.kind];
+    if (words) return words();
+    const rest = Object.entries(p).filter(([, v]) => v != null && v !== '').map(([k, v]) => `${esc(k)} ${code(typeof v === 'object' ? JSON.stringify(v) : v)}`).join(' · ');
+    return `${esc(e.kind)}${rest ? ' · ' + rest : ''}`;
+  },
+
+  async openSession(el, visit) {
+    const { $, esc } = DC;
+    this.S.visit = visit;
+    const box = $('#sess-one', el), body = $('#sess-timeline', el);
+    box.hidden = false;
+    DC.states.loading(body, { cols: 3 });
+    let r;
+    try { r = await DC.client.experienceSession(visit, { query: { model_text: $('#sess-model-text', el).checked }, quiet: true }); }
+    catch (e) { DC.states.failed(body, e, { retry: () => this.openSession(el, visit), cols: 3 }); return; }
+    if (this.S.visit !== visit) return;
+    const c = r.session;
+    $('#sess-one-title', el).textContent = c.problem ? (c.problem.length > 70 ? c.problem.slice(0, 70) + '…' : c.problem) : 'A session';
+    const drafts = r.drafts || {};
+    const links = [...c.projects.map(p => `<a href="#project" data-open-project="${esc(p)}">${esc((c.project_names || {})[p] || p)}</a>`),
+      ...c.conversations.map(d => drafts[d] ? `<a href="#home" data-resume-draft="${esc(d)}">draft ${esc(d)}</a>` : `<span class="mono xs" title="An intern session">${esc(d)}</span>`)].join(' · ');
+    $('#sess-one-sub', el).innerHTML = `${esc(c.who || '')} · ${esc(this.when(c.started))} to ${esc(this.when(c.ended))} · ${c.events} events${links ? ' · ' + links : ''}`;
+    const who = { person: 'Person', agent: 'Agent', model: 'Model', system: 'DCLab' };
+    const job = e => e.ids.job ? ` <a class="xs" href="#compute" data-open-job="${esc(e.ids.job)}">job</a>` : '';
+    const flagged = (c.flags || []).map(f => `<tr><td colspan="3"><div class="callout ${f.severity === 'high' ? 'bad' : 'warn'} small"><b>${esc(f.detector.replace(/_/g, ' '))}</b>: ${esc(f.message)}</div></td></tr>`).join('');
+    body.innerHTML = flagged + (r.cut ? `<tr><td colspan="3"><div class="callout warn small">A long session: the newest ${r.events.length.toLocaleString()} events are shown.</div></td></tr>` : '')
+      + r.events.map(e => `<tr><td class="mono small" data-style="white-space:nowrap">${esc(this.when(e.at))}</td><td>${esc(who[e.actor] || e.actor)}</td><td class="small">${this.what(e)}${job(e)}</td></tr>`).join('');
+    DC.hydrate(el);
+    box.scrollIntoView({ block: 'nearest' });
+  },
+
+  async loadPolicies(el) {
+    const pol = await DC.client.platformPolicies();
+    this.paintPolicies(el, pol);
+    this.paintStats(el, pol, this.S.limits, this.S.intern);
+  },
+
+  paintStats(el, pol, lim, intern) {
+    const { $, esc } = DC;
+    this.S.limits = lim; this.S.intern = intern;
+    const stat = (v, l) => `<div class="stat"><span class="v">${esc(v)}</span><span class="l">${l}</span></div>`;
+    const checked = pol.invariants.filter(i => i.checked), holding = checked.filter(i => i.holds).length;
+    const sw = pol.switches.map(s => `${esc(s.gate)} gate on in ${s.on} of ${s.total}`).join(' · ');
+    const b = lim && lim.intern_session.defaults;
+    $('#admin-stats', el).innerHTML =
+      stat(pol.invariants.length + pol.switches.length, `policies · ${pol.invariants.length} locked, ${holding} of ${checked.length} checked against the validator just now${holding === checked.length ? '' : ' · <b>some do not hold</b>'} · ${pol.switches.length} per-project gate switches`) +
+      stat('0', 'user accounts or roles · one local workspace; the validator tells a person from the intern') +
+      stat(intern ? (intern.available ? '1' : '0') : '—', intern ? (intern.available ? `model configured: ${esc(intern.model)} via ${esc(intern.endpoint)}` : 'models configured · the intern follows the standard DCLab plan') : 'model status unavailable') +
+      stat(b ? b.max_steps : '—', b ? `tool calls and ${b.max_minutes} min per intern session by default · model requests are counted by the gateway` : 'budget defaults unavailable');
+    if (pol.switches.length) $('#policy-sub', el).textContent = `Locked rules hold in every project; the two gate switches are set per project (${sw}).`;
+  },
+
+  paintPolicies(el, pol) {
+    const { $, esc, linkIds } = DC;
+    const ids = list => list.length ? `<span class="ev-list">${list.map(i => linkIds(i)).join('')}</span>` : '';
+    const tags = html => `<span class="row">${html}</span>`;
+    const locked = pol.invariants.map(i => `<div class="list-item"><div class="li-main">
+        <div class="spread"><label class="switch"><input type="checkbox" checked disabled><span class="track"></span><span>${esc(i.title)}</span></label>
+        ${tags(ids([...i.rules, ...i.evidence]) + '<span class="pill">locked</span>' + (i.checked ? `<span class="pill ${i.holds ? 'ok' : 'bad'}" title="Asked the validator just now with a probe project">${i.holds ? 'holds now' : 'does not hold'}</span>` : '<span class="pill outline" title="Enforced in the stage engine; not probed by this page">in the engine</span>'))}</div>
+        <span class="li-sub">${esc(i.detail)} <span class="mono xs">${esc(i.where)}</span></span></div></div>`).join('');
+    const switches = pol.switches.map(s => {
+      const rows = s.projects.length ? s.projects.map(p => `<div class="row"><label class="switch"><input type="checkbox" data-project="${esc(p.id)}" data-key="${esc(s.key)}" ${p.on ? 'checked' : ''}><span class="track"></span><span></span></label><a href="#project" data-open-project="${esc(p.id)}">${esc(p.name)}</a></div>`).join('')
+        : '<span class="muted">No projects yet.</span>';
+      return `<div class="list-item"><div class="li-main">
+        <div class="spread"><span class="li-title">${esc(s.title)}</span>${tags(ids(s.rules) + '<span class="pill accent">per project</span>')}</div>
+        <span class="li-sub">${esc(s.applies)} New projects start with it ${s.default ? 'on' : 'off'}; there is no workspace default to change. On in ${s.on} of ${s.total} project${s.total === 1 ? '' : 's'}:</span>
+        <div class="stack tight" data-style="margin-top:6px">${rows}</div></div></div>`;
+    }).join('');
+    $('#policy-list', el).innerHTML = locked + switches;
+
+    /* Roles: with accounts on (package 10.2) the four roles are enforced on every route; the actor matrix is the validator's own answer */
+    $('#roles-real', el).hidden = false;
+    if (pol.accounts.users) { this.paintEnforcedRoles(el, pol); return; }
+    $('#roles-sub', el).textContent = 'No user accounts yet: one local workspace';
+    const inv = $('#invite-btn', el);
+    inv.dataset.toast = 'Not built: DCLab has no user accounts yet. It runs as one local workspace on this machine.';
+    $('#roles-note', el).innerHTML = `<span class="ic">${DC.icon('info')}</span><span><b>No users, roles or sign-in today.</b> DCLab runs as one local workspace on this machine; the server issues a CSRF token at start and every write request must carry it. The one real control is <b>View as</b> in the top bar, and it is ${esc(pol.accounts.view_as)}. What is enforced is the difference between a person and the intern, below; the roles table after it is a plan.</span>`;
+    const sym = c => {
+      const reason = c.failed.includes('Holdout reuse confirmed');
+      const t = c.status === 'allowed' ? '<span class="yes">✓</span>' : c.status === 'needs_approval' ? `<span class="ask">${reason ? 'with a reason' : 'asks'}</span>` : '<span class="no">—</span>';
+      return `<td title="${esc(c.message)}">${t}</td>`;
+    };
+    $('#actor-matrix', el).innerHTML = `<thead><tr><th>Move</th><th>A person</th><th>The intern</th></tr></thead><tbody>${pol.actors.map(a => `<tr><td>${esc(a.action)}</td>${sym(a.person)}${sym(a.intern)}</tr>`).join('')}</tbody>`;
+    $('#roles-foot', el).textContent = '"Asks" means the move waits for a person (a signature, an approval or a written reason); "—" means it is refused. Hover a cell for the validator\'s message.';
+    DC.hydrate(el);
+  },
+
+  paintEnforcedRoles(el, pol) {
+    const { $, esc } = DC;
+    $('#roles-sub', el).textContent = `Accounts are on (${pol.accounts.mode === 'oidc' ? 'your company\'s identity provider' : 'password sign-in'}): every route checks the role`;
+    const inv = $('#invite-btn', el);
+    delete inv.dataset.toast;
+    inv.onclick = () => DC.selectPane(el, 'members');
+    $('#roles-note', el).innerHTML = `<span class="ic">${DC.icon('info')}</span><span><b>Roles are enforced.</b> Each request is a signed-in member, or an API token acting as one; the role decides what it may do, on every route. The intern is the agent, not a member: what it may do is the validator's answer below.</span>`;
+    const ROLES = ['Owner', 'ML engineer', 'Reviewer', 'Business viewer'];
+    const ACT = [['Read every page, ask questions', 'yyyy'], ['Create and change projects, data, solutions, runs and drafts', 'yy--'], ['Approve a stage\'s choice', 'yyy-'],
+                 ['Approve a gate (solution sign-off, opening the holdout)', 'y-y-'], ['Review a lesson, move a model purpose', 'y-y-'], ['Gate switches, the training opt-in, members', 'y---']];
+    const cell = v => `<td>${v === 'y' ? '<span class="yes">✓</span>' : '<span class="no">—</span>'}</td>`;
+    $('#role-matrix', el).innerHTML = `<thead><tr><th>Action</th>${ROLES.map(r => `<th>${r}</th>`).join('')}</tr></thead><tbody>${ACT.map(([a, v]) => `<tr><td>${esc(a)}</td>${[...v].map(cell).join('')}</tr>`).join('')}</tbody>`;
+    const plan = $('#roles-real .pill.outline', el);
+    if (plan) { plan.textContent = 'enforced on every route'; plan.className = 'pill ok'; }
+    const sym = c => `<td title="${esc(c.message)}">${c.status === 'allowed' ? '<span class="yes">✓</span>' : c.status === 'needs_approval' ? '<span class="ask">asks</span>' : '<span class="no">—</span>'}</td>`;
+    $('#actor-matrix', el).innerHTML = `<thead><tr><th>Move</th><th>A person</th><th>The intern</th></tr></thead><tbody>${pol.actors.map(a => `<tr><td>${esc(a.action)}</td>${sym(a.person)}${sym(a.intern)}</tr>`).join('')}</tbody>`;
+    DC.hydrate(el);
+  },
+
+  async loadMembers(el) {
+    const { $, esc } = DC;
+    const cfg = await DC.config();
+    const auth = cfg.auth || {};
+    const body = $('#members-table tbody', el);
+    if (auth.mode === 'none' || !auth.signed_in) {
+      body.innerHTML = '<tr><td colspan="5"><div class="empty">Sign-in is off: this server is one owner on this machine. To turn it on, run <code>make login</code> once in the terminal (it asks for a username and a password), then restart <code>make dev</code>. You can then add friends here.</div></td></tr>';
+      $('#tokens-list', el).innerHTML = '<div class="empty">API tokens come with accounts. Without them, MCP clients on this machine use /mcp as the owner.</div>';
+      return;
+    }
+    const owner = auth.role === 'owner';
+    const roles = [['owner', 'Owner'], ['data_scientist', 'ML engineer'], ['reviewer', 'Reviewer'], ['viewer', 'Business viewer']];
+    let members = [];
+    try { members = await DC.client.members({ quiet: true }); } catch (err) { DC.states.failed(body, err, { retry: () => this.loadMembers(el), cols: 5 }); return; }
+    let budgets = { users: {}, default: 15 };
+    if (owner) { try { budgets = await DC.client.memberBudgets({ quiet: true }); } catch (err) { /* shown as the default */ } }
+    $('#members-sub', el).textContent = `${members.length} member${members.length === 1 ? '' : 's'} · ${owner ? 'you manage them as the owner' : 'the owner manages them'}`;
+    body.innerHTML = members.map(m => `<tr><td><div class="cell-main">${esc(m.name || m.username || m.email)}</div><div class="cell-sub">${esc([m.username, m.email].filter(Boolean).join(' · '))}${m.id === auth.user_id ? ' · you' : ''}</div></td>
+      <td>${owner ? `<select data-member-role="${esc(m.id)}" aria-label="Role of ${esc(m.username || m.email)}">${roles.map(([k, l]) => `<option value="${k}" ${k === m.role ? 'selected' : ''}>${l}</option>`).join('')}</select>` : esc(m.role_label)}</td>
+      <td class="small">${m.single_sign_on ? 'company account' : m.password ? 'password' : '—'}</td>
+      <td>${owner ? `<span class="row"><label class="sr-only" for="budget-${esc(m.id)}">Monthly model budget of ${esc(m.username || m.email)}</label><input id="budget-${esc(m.id)}" type="number" min="0.01" step="0.5" value="${esc(String((budgets.users || {})[m.id] ?? budgets.default ?? 15))}" data-style="width:80px" data-member-budget="${esc(m.id)}"><button type="button" class="btn sm" data-member-budget-save="${esc(m.id)}">Save</button></span>` : '—'}</td>
+      <td>${owner && m.id !== auth.user_id ? `<button type="button" class="btn sm" data-member-remove="${esc(m.id)}">Remove</button>` : ''}</td></tr>`).join('');
+    const add = $('#member-add', el);
+    add.hidden = !owner;
+    $('#member-role', el).innerHTML = roles.map(([k, l]) => `<option value="${k}" ${k === 'viewer' ? 'selected' : ''}>${l}</option>`).join('');
+    $('#member-secret', el).hidden = auth.mode !== 'password';
+    $('#member-role', el).disabled = $('#member-own', el).checked;
+    DC.hydrate(el);
+  },
+
+  async loadLimits(el) {
+    const { $, esc } = DC;
+    let q;
+    try { q = await DC.client.platformQuotas({ quiet: true }); } catch (err) { DC.states.failed($('#limits-table tbody', el), err, { retry: () => this.loadLimits(el), cols: 3 }); return; }
+    if (!q.on) { $('#limits-table tbody', el).innerHTML = `<tr><td colspan="3"><div class="empty">${esc(q.note)}</div></td></tr>`; return; }
+    const fmt = (kind, v) => v == null ? '—' : kind === 'upload_bytes' ? `${(v / 1024 / 1024).toLocaleString('en-US', { maximumFractionDigits: 0 })} MB`
+      : kind === 'model_eur' ? `€${Number(v).toFixed(2)}` : Number(v).toLocaleString('en-US');
+    const cell = (kind, part) => `<td class="num mono">${fmt(kind, part.used)} <span class="muted">/ ${part.limit == null ? 'no limit' : fmt(kind, part.limit)}</span>${part.limit && part.used >= part.limit ? ' <span class="pill bad">reached</span>' : ''}</td>`;
+    $('#limits-sub', el).textContent = 'Per person and per workspace; a request over one gets 429 with what was reached and when it resets';
+    $('#limits-table tbody', el).innerHTML = q.limits.map(l => `<tr><td>${esc(l.words)}</td>${cell(l.kind, l.user)}${cell(l.kind, l.workspace)}</tr>`).join('');
+  },
+
+  async loadTokens(el) {
+    const { $, esc } = DC;
+    const cfg = await DC.config();
+    if (!(cfg.auth || {}).signed_in || cfg.auth.mode === 'none') return;
+    let tokens = [];
+    try { tokens = await DC.client.tokens({ quiet: true }); } catch (err) { DC.states.failed($('#tokens-list', el), err, { retry: () => this.loadTokens(el) }); return; }
+    const when = t => t ? new Date(t * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'never';
+    $('#tokens-list', el).innerHTML = tokens.length ? tokens.map(t => `<div class="list-item"><div class="li-main"><span class="li-title">${esc(t.name)}</span>
+      <span class="li-sub mono">${esc(t.prefix)}… · made ${when(t.created)} · last used ${when(t.last_used)}</span></div><button type="button" class="btn sm" data-token-revoke="${esc(t.id)}">Revoke</button></div>`).join('')
+      : '<div class="empty">No tokens yet.</div>';
+    $('#token-add', el).hidden = false;
+  },
+
+  paintModels(el, m, gw) {
+    const { $, esc } = DC;
+    $('#models-sub', el).textContent = gw ? 'Every request goes through one gateway: each purpose uses a tier, and a local model can serve the cheap one' : 'Model status';
+    const pill = $('#tier3-pill', el);
+    const live = gw ? gw.tiers.some(t => t.available) : m.available;
+    pill.className = 'pill ' + (live ? 'ok' : 'warn');
+    pill.textContent = live ? 'configured' : 'not configured';
+    if (!gw) { $('#tier3-body', el).innerHTML = `<span class="muted">${m.available ? esc(m.model) + ' via ' + esc(m.endpoint) : 'No model is configured: every part of DCLab uses its deterministic path.'}</span>`; return; }
+    const tiers = gw.tiers.map(t => `<tr><td><b>${esc(t.name)}</b></td><td class="mono small">${esc(t.endpoint)}${t.local ? ' <span class="pill ok">this machine</span>' : ''}</td><td class="mono small">${esc(t.model)}</td><td><span class="pill ${t.available ? 'ok' : 'outline'}">${t.available ? 'ready' : (t.key_configured ? 'SDK missing' : 'no key')}</span></td></tr>`).join('');
+    /* A6.4: which tier serves each purpose now, which local model shadows it (never used), and how often they agree */
+    const local = [...gw.tiers, gw.tuned].filter(t => t && t.local && t.available).map(t => t.name);
+    const agree = {}; (gw.agreement || []).forEach(a => { agree[a.purpose] = a; });
+    const rate = v => v == null ? '—' : Math.round(v * 100) + '%';
+    const purposes = gw.purposes.map(p => {
+      const a = agree[p.purpose], set = !!(p.routing || {}).serve, moved = p.serving !== p.tier, tuned = gw.tuned && gw.tuned.available && !set && p.routable;
+      if (!p.routable) return `<tr><td class="mono small">${esc(p.purpose)}</td><td>${esc(p.tier)} <span class="xs muted">sent by the research campaign's own client: not routed</span></td><td></td><td></td><td class="small muted">${esc(p.may_see)}</td></tr>`;
+      const shadow = `<select data-shadow="${esc(p.purpose)}" aria-label="Shadow model for ${esc(p.purpose)}"><option value="">none</option>${local.filter(t => t !== p.serving).map(t => `<option${(p.routing || {}).shadow === t ? ' selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
+      const held = set && !moved ? ` <span class="pill warn" title="The approved model is not the one configured now, or it cannot answer: the purpose uses its own tier until someone approves again">approved ${esc(p.routing.serve_model || '')}: not serving</span>` : '';
+      const serve = set ? `${held}<button type="button" class="link-btn small" data-serve-back="${esc(p.purpose)}">Back to ${esc(p.tier)}</button>`
+        : tuned ? `<button type="button" class="link-btn small" data-serve-tuned="${esc(p.purpose)}">Serve with tuned…</button>` : '';
+      return `<tr><td class="mono small">${esc(p.purpose)}</td><td>${moved ? `<b>${esc(p.serving)}</b> <span class="pill warn">moved from ${esc(p.tier)}</span>` : esc(p.tier)} ${serve}</td>`
+        + `<td>${local.length ? shadow : '<span class="xs muted">no local model</span>'}</td>`
+        + `<td class="small">${a ? `${rate(a.same_tool)} same tool · ${rate(a.same_arguments)} same arguments · ${a.disagreements} of ${a.requests} disagree${a.errors ? ` · ${a.errors} failed` : ''}` : '<span class="muted">—</span>'}</td>`
+        + `<td class="small muted">${esc(p.may_see)}</td></tr>`;
+    }).join('');
+    const failing = (gw.failing || []).map(f => `<div class="callout warn small"><span><b>${esc(f.model)}</b> failed the ${esc(f.purpose)} output check ${f.failed} of ${f.checked} times this month (${esc(f.tier)} tier)${f.last_reason ? ': ' + esc(f.last_reason) : ''}. Consider another model for this tier.</span></div>`).join('');
+    $('#tier3-body', el).innerHTML = `${failing}
+      <div class="table-wrap"><table class="data compact"><thead><tr><th>Tier</th><th>Endpoint</th><th>Model</th><th></th></tr></thead><tbody>${tiers}</tbody></table></div>
+      <div class="table-wrap"><table class="data compact"><thead><tr><th>Purpose</th><th>Served by</th><th>Shadow</th><th>Agreement</th><th>What it may be shown</th></tr></thead><tbody>${purposes}</tbody></table></div>
+      <span class="xs muted">A shadow is a model on this machine that receives a copy of each request after the served model answered. Its answer is compared and logged, never used: the validator sees only the served model's moves, and no budget counts it. Moving a purpose to another model needs a reviewer and a reason (the role is declared until accounts exist); moving it back is one click. Every change is in the audit.</span>
+      <span class="xs muted">Keys stay on the server. To change a tier set <code>DCLAB_TIER_&lt;TIER&gt;_BASE_URL</code>, <code>_MODEL</code> and <code>_API_KEY</code> in <code>.env</code> (unset tiers use <code>OPENAI_*</code>), then restart the server.</span>`;
+  },
+
+  paintLimits(el, l) {
+    const { $, esc } = DC;
+    const n = v => Number(v).toLocaleString('en-US');
+    const box = (label, value, sub) => `<div class="field"><span class="label">${esc(label)}</span><div class="inset small">${value}${sub ? `<div class="xs muted">${sub}</div>` : ''}</div></div>`;
+    const i = l.intern_session, d = l.draft_settings;
+    $('#spend-pill', el).hidden = l.spend.tracked;
+    $('#budget-body', el).innerHTML =
+      box('Per intern session', `<b>${i.defaults.max_steps} tool calls · ${i.defaults.max_minutes} min</b> <span class="pill ok">enforced</span>`, `Caps: ${i.caps.max_steps[0]}–${i.caps.max_steps[1]} calls, ${i.caps.max_minutes[0]}–${i.caps.max_minutes[1]} min. ${esc(i.note)}`) +
+      box('Per project (new-project wizard)', `${d.defaults.calls} calls · ${d.defaults.minutes} min · €${d.defaults.eur}`, `Caps: ${d.caps.calls[0]}–${d.caps.calls[1]} calls, ${d.caps.minutes[0]}–${d.caps.minutes[1]} min, €${d.caps.eur[0]}–${n(d.caps.eur[1])}. ${esc(d.note)}`) +
+      box('Rows and folds', `${n(d.defaults.max_rows)} rows · ${d.defaults.folds} folds by default`, `Quick mode uses ${n(l.rows.quick)} rows; full runs ${n(l.rows.caps[0])}–${n(l.rows.caps[1])}. Folds ${d.caps.folds[0]}–${d.caps.folds[1]}.`) +
+      box('Model spend this month', l.spend.tracked
+        ? `<b>€${Number(l.spend.eur_this_month || 0).toFixed(2)}</b>${l.spend.unpriced_this_month ? ` <span class="pill warn">${n(l.spend.unpriced_this_month)} request${l.spend.unpriced_this_month === 1 ? '' : 's'} without a price</span>` : ''}${l.spend.workspace_cap != null ? ` · workspace cap €${l.spend.workspace_cap}` : ''}`
+        : '<span class="muted">Not tracked</span>', esc(l.spend.note));
+    const mb = v => Math.round(v / 1048576) + ' MB';
+    $('#privacy-body', el).innerHTML = l.privacy.map(p => `<div class="inset stack tight"><div class="spread"><b>${esc(p.title)}</b><span class="pill ${p.on ? 'ok' : 'outline'}">${p.on ? 'yes' : 'no'}</span></div><span class="muted">${esc(p.text)}</span></div>`).join('') +
+      `<dl class="kv"><dt>Upload limit</dt><dd>${mb(l.upload_max_bytes)} per file · ${mb(l.connector_max_bytes)} per connector import</dd><dt>Workspace folder</dt><dd class="mono xs">${esc(l.storage)}</dd></dl>` +
+      '<div id="consent-box" class="stack tight"><b>Sharing</b><span class="small muted">Nothing here leaves this machine: this edition sends no records anywhere.</span></div>';
+  },
+
+  // 19.10: what may leave this workspace; each use off until the owner turns it on, every change in the audit log
+  async loadConsent(el) {
+    const { $, esc, toast } = DC;
+    const box = $('#consent-box', el);
+    if (!box) return;
+    let c;
+    try { c = await DC.client.readConsent({ quiet: true }); } catch (e) { DC.states.failed(box, e, { retry: () => this.loadConsent(el) }); return; }
+    const words = { improve: ['Use what happens here to improve DCLab', 'Sessions and decisions read by the DCLab team and turned into test cases. Text is redacted (names, e-mails, phone numbers, addresses, ids, amounts); table values never leave, and model prompts and replies only under training.'],
+                    train: ['Use it to train DCLab\'s models', 'The same, plus the decision records (their states hold bands, never values) and, redacted, the prompts and replies of the model calls this workspace chose to keep (DCLAB_LOG_PROMPTS) for the few purposes that were shown no data. A project takes part only when its own switch is on too.'] };
+    box.innerHTML = '<b>Consent</b>' + c.uses.map(u => `<label class="switch"><input type="checkbox" data-consent="${esc(u)}" ${c.workspace[u] ? 'checked' : ''}><span class="track"></span><span>${esc(words[u][0])}<span class="xs muted" data-style="display:block">${esc(words[u][1])}</span></span></label>`).join('');
+    box.querySelectorAll('[data-consent]').forEach(input => input.addEventListener('change', async () => {
+      try { await DC.client.setConsent({ body: { use: input.dataset.consent, on: input.checked } }); toast('Saved. The change is in the audit log.'); }
+      catch (err) { input.checked = !input.checked; toast(err.message, { ok: false }); }
+    }));
+  },
+
+  async loadAudit(el) {
+    const { $, esc, linkIds } = DC;
+    const S = this.S;
+    let a;
+    const query = { limit: S.limit, offset: S.offset };
+    ['kind', 'status', 'actor', 'project'].filter(f => S[f]).forEach(f => { query[f] = S[f]; });
+    try { a = await DC.client.platformAudit({ query, quiet: true }); } catch (e) { DC.states.failed($('#audit-body', el), e, { retry: () => this.loadAudit(el), cols: 3 }); return; }
+    const when = s => { const t = new Date(s); return isNaN(t) ? esc(s || '') : t.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }); };
+    const what = e => {
+      const g = e.args || {};
+      const verb = {
+        run_stage: `${e.status === 'allowed' ? 'Ran' : 'Asked to run'} stage <code>${esc(g.stage || '')}</code>${g.reuse_reason ? ' (holdout reuse: ' + esc(g.reuse_reason) + ')' : ''}`,
+        set_solution: `${e.status === 'allowed' ? 'Saved' : 'Asked to change'} the solution${g.target ? ' · target <code>' + esc(g.target) + '</code>' : ''}`,
+        approve_stage: `${e.status === 'allowed' ? 'Approved' : 'Asked to approve'} stage <code>${esc(g.stage || '')}</code>${g.choice ? ' · chose <code>' + esc(g.choice) + '</code>' : ''}`,
+        approve_gate: `${e.status === 'allowed' ? 'Approved' : 'Asked to approve'} the ${esc(g.gate || '')} gate`,
+        capture: 'Exported the notebook and report',
+        use_approval: `Used the ${esc(g.gate || '')} approval`,
+        set_policy: `Turned ${g.on ? 'on' : 'off'} the ${esc(g.label || g.policy || '')} switch`,
+        set_training_opt_in: `Turned ${g.on ? 'on' : 'off'} sharing this project's runs for training the policy model`,
+        attach_data: `Attached the table <code>${esc((e.detail || {}).filename || '')}</code>${(e.detail || {}).rows ? ' · ' + Number(e.detail.rows).toLocaleString() + ' rows' : ''}${(e.detail || {}).source && e.detail.source.kind !== 'upload' ? ' from ' + esc(e.detail.source.kind === 'sample' ? 'the sample ' + (e.detail.source.key || '') : e.detail.source.kind) : ''}`,
+        add_asset: `Brought <code>${esc((e.detail || {}).filename || '')}</code> into a draft${(e.detail || {}).source ? ' · ' + esc(e.detail.source.kind || '') : ''}${(e.detail || {}).synthetic ? ' (synthetic)' : ''}`,
+        review_lesson: `${g.action === 'reject' ? 'Rejected' : 'Accepted'} a workspace lesson`,
+        remove_memory_note: 'Removed a note from the project memory',
+        set_routing: g.setting === 'serve' ? `Moved <code>${esc(g.purpose || '')}</code> from ${esc(g.from || 'its own tier')} to ${esc(g.to || 'its own tier')}`
+          : `${g.to ? 'Set' : 'Removed'} the shadow of <code>${esc(g.purpose || '')}</code>${g.to ? ': ' + esc(g.to) : ''}`,
+      }[e.move] || esc(e.move || '');
+      const failed = (e.outcome || '').startsWith('failed');
+      const pill = e.status === 'blocked' ? '<span class="pill bad">refused</span>' : e.status === 'needs_approval' ? '<span class="pill warn">waited for a person</span>' : failed ? '<span class="pill bad">failed</span>' : '';
+      const sha = (e.detail || {}).sha256 ? 'SHA-256 ' + e.detail.sha256.slice(0, 16) + '…' : (e.detail || {}).solution_hash ? 'solution hash ' + String(e.detail.solution_hash).slice(0, 12) : '';
+      const detail = e.status !== 'allowed' ? e.message : ['approval', 'routing', 'lesson_review', 'memory_removed'].includes(e.kind) && e.message ? 'Reason: ' + e.message : sha || (e.outcome || '').replace(/^done: /, '');
+      const where = e.project ? `<a href="#project" data-open-project="${esc(e.project.id)}">${esc(e.project.name)}</a>` : e.draft_id ? 'a draft on Home' : 'workspace';
+      return `<div class="row">${verb} ${pill}<span class="muted">· ${where}</span></div>${detail ? `<div class="xs muted">${linkIds(detail.length > 220 ? detail.slice(0, 220) + '…' : detail)}</div>` : ''}`;
+    };
+    $('#audit-sub', el).textContent = `Every move the workflow validator checked, allowed or refused, every gate approval and switch change, solution saved and table imported, across ${a.projects} project${a.projects === 1 ? '' : 's'}. One append-only log: the app can add to it, never change or delete it.`;
+    $('#audit-filters', el).hidden = !a.counts.all;
+    $('#audit-body', el).innerHTML = a.items.length ? a.items.map(e => `<tr><td class="mono small" data-style="white-space:nowrap">${when(e.at)}</td><td>${esc(e.who)}</td><td class="small">${what(e)}</td></tr>`).join('')
+      : `<tr><td colspan="3"><div class="empty">${a.total ? 'No more entries.' : a.counts.all ? 'Nothing matches these filters.' : 'Nothing logged yet: the log starts with the first table, solution or move.'}</div></td></tr>`;
+    $('#audit-foot', el).hidden = !a.total;
+    $('#audit-range', el).textContent = a.total ? `${a.offset + 1}–${Math.min(a.offset + a.items.length, a.total)} of ${a.total} · ${a.counts.blocked} refused · ${a.counts.waiting} waited for a person · ${a.counts.approvals} approvals` : '';
+    $('#audit-newer', el).disabled = a.offset === 0;
+    $('#audit-older', el).disabled = a.offset + a.items.length >= a.total;
+    const tab = $('.ptab[data-ptab="audit"]', el);
+    if (tab) tab.dataset.total = a.total;
+    DC.hydrate(el);
+  },
+});

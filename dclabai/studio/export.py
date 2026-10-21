@@ -1,0 +1,374 @@
+"""Export a finished project as a runnable notebook and a report.
+
+The notebook reproduces the approved workflow with plain scikit-learn code so an
+engineer can take it anywhere: the same solution, split, recipe, model and
+parameters, and the same once-only holdout.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+from .store import STAGE_KEYS
+
+MODEL_IMPORTS = {
+    "logistic_regression": ("from sklearn.linear_model import LogisticRegression", "LogisticRegression(C=1.0, max_iter=3000)"),
+    "ridge": ("from sklearn.linear_model import Ridge", "Ridge(alpha=1.0)"),
+    "linear_svm": ("from sklearn.svm import LinearSVC", "LinearSVC(C=0.1, max_iter=5000, random_state=42)"),
+    "complement_nb": ("from sklearn.naive_bayes import ComplementNB", "ComplementNB(alpha=1.0)"),
+    "extra_trees": ("from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor", "{cls}(n_estimators=300, min_samples_leaf=2, n_jobs=4, random_state=42)"),
+    "hist_gradient_boosting": ("from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor", "{cls}(random_state=42)"),
+    "lightgbm": ("import lightgbm as lgb", "lgb.{cls}(n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, n_jobs=4, verbose=-1)"),
+    "xgboost": ("import xgboost as xgb", "xgb.{cls}(n_estimators=300, learning_rate=0.1, max_depth=6, tree_method='hist', n_jobs=4, random_state=42, verbosity=0)"),
+    # 15.5's rare-event families come from DCLab's own package (dclabai must be importable where the notebook runs)
+    "percentile_rules": ("from dclabai.expansion.detectors import PercentileRules", "PercentileRules()"),
+    "ecod": ("from dclabai.expansion.detectors import ECOD", "ECOD()"),
+    "isolation_forest": ("from dclabai.expansion.detectors import IsolationForestDetector", "IsolationForestDetector()"),
+    "pu_bagging": ("from dclabai.expansion.detectors import PUBagging", "PUBagging()"),
+}
+NOT_EXPORTED = {"entity_behaviour": "the entity behaviour recipe (package 15.4) is not written into notebooks yet: export the "
+                                    "project after choosing another recipe, or use the stage records",
+                "engineered": "the feature engineer's programs (package 18.5) are not written into notebooks yet: export the "
+                              "project after choosing another recipe, or use the stage records"}
+
+
+class ExportUnsupported(ValueError):
+    """The project chose something the notebook cannot reproduce yet; the reason says what."""
+CLASS_NAMES = {
+    "extra_trees": ("ExtraTreesClassifier", "ExtraTreesRegressor"),
+    "hist_gradient_boosting": ("HistGradientBoostingClassifier", "HistGradientBoostingRegressor"),
+    "lightgbm": ("LGBMClassifier", "LGBMRegressor"),
+    "xgboost": ("XGBClassifier", "XGBRegressor"),
+}
+METRIC_CODE = {
+    "roc_auc": ("roc_auc_score", "roc_auc_score(y_true, scores)"),
+    "average_precision": ("average_precision_score", "average_precision_score(y_true, scores)"),
+    "macro_f1": ("f1_score", "f1_score(y_true, scores.argmax(axis=1), average='macro')"),
+    "mae": ("mean_absolute_error", "mean_absolute_error(y_true, scores)"),
+}
+
+
+def _cell(kind: str, source: str, role: str | None = None) -> dict[str, Any]:
+    """A notebook cell; ``role`` marks the cells the page's kernel treats apart (``holdout``: the one read of the holdout)."""
+    cell = {"cell_type": kind, "metadata": {"dclab": {"role": role}} if role else {}, "source": source.rstrip("\n") + "\n"}
+    if kind == "code":
+        cell.update(execution_count=None, outputs=[])
+    return cell
+
+
+SYNTHETIC_NOTE = ("**Synthetic data.** These rows were generated from a prompt, not collected. The scores below test the method "
+                  "on simulated data and say nothing about real cases.")
+
+
+def _folds(project: dict[str, Any], records: dict[str, dict[str, Any]]) -> int:
+    """Training folds the notebook must reproduce: what the stages recorded (``cv_protocol``, e.g.
+    ``StratifiedKFold(5, shuffle, …)``), else the project's setting, else 3."""
+    for stage in ("final", "models", "features", "leakage", "data"):
+        found = re.search(r"\((\d+)[,)]", str((records.get(stage, {}).get("evidence") or {}).get("cv_protocol") or ""))
+        if found:
+            return int(found.group(1))
+    try:
+        return max(2, min(int((project.get("settings") or {}).get("folds") or 3), 10))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _read_code(filename: str) -> str:
+    """The pandas call that loads the project's data file, by type, the same way ``data.load_table`` does."""
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".parquet":
+        return f"pd.read_parquet({filename!r})"
+    if suffix in (".tsv", ".tab"):
+        return f"pd.read_csv({filename!r}, sep='\\t', low_memory=False)"
+    if suffix in (".xlsx", ".xls"):
+        return f"pd.read_excel({filename!r})"
+    if suffix == ".json":
+        return f"pd.read_json({filename!r})"
+    return f"pd.read_csv({filename!r}, low_memory=False)"
+
+
+def notebook(project: dict[str, Any], records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    solution = project["solution"] or {}
+    data = project["data"] or {}
+    task = solution.get("task", "binary")
+    regression = task == "regression"
+    features = records.get("features", {}).get("decision", {})
+    feature_evidence = records.get("features", {}).get("evidence", {})
+    codes = list(feature_evidence.get("category_code_columns", []))
+    # Records made before the engine one-hot encoded codes say nothing about encoding: their codes were numbers.
+    encode_codes = feature_evidence.get("category_code_encoding", "passed as numbers") != "passed as numbers"
+    models = records.get("models", {}).get("decision", {})
+    final = records.get("final", {}).get("evidence", {})
+    recipe = features.get("chosen") or features.get("selected") or "raw"
+    from dclabai import kinds
+
+    try:  # 16.1: the kind says what its export supports; one that reads its own target needs its own notebook code
+        kind = kinds.resolve(solution, project.get("pack") or ((project.get("draft") or {}).get("pack") or {}).get("key"))
+    except KeyError as error:
+        raise ExportUnsupported(f"This notebook cannot be exported: {error.args[0]}") from None
+    if not kind.export.get("notebook", True) or type(kind).target is not type(kinds.get(kind.base_task)).target:
+        raise ExportUnsupported(f"This notebook cannot be exported yet: the {kind.title.lower()} kind reads its own target, and "
+                                "its notebook code is not written")
+    if solution.get("spatial"):  # 16.10: the notebook's split code knows time and group columns, not blocks of places
+        raise ExportUnsupported("This notebook cannot be exported yet: the project splits by blocks of places, and the notebook would "
+                                "split at random instead (the score it reproduces would flatter areas it trained on)")
+    if recipe in NOT_EXPORTED:
+        raise ExportUnsupported(f"This notebook cannot be exported yet: {NOT_EXPORTED[recipe]}.")
+    family = models.get("chosen") or models.get("selected") or ("ridge" if regression else "logistic_regression")
+    every = final.get("selected_model_params") or {}
+    params = {k.replace("model__", ""): v for k, v in every.items() if not k.startswith("review__")}
+    change = {k: v for k, v in every.items() if k.startswith("review__")}  # what a review round kept (17.6), replayed below
+    weighted, clip = change.get("review__class_weight") == "balanced", change.get("review__clip") == "fit_range"
+    metric = records.get("final", records.get("features", {})).get("primary_metric") or ("mae" if regression else "roc_auc")
+    forbidden = [f["column"] for f in solution.get("forbidden", [])]
+    identifiers = list(solution.get("identifiers", []))
+    time_column, group_column = solution.get("time_column"), solution.get("group_column")
+    drop = sorted(set(forbidden + identifiers + ([time_column] if time_column else []) + ([group_column] if group_column else []) + list(solution.get("text_columns", []))))
+    import_line, ctor = MODEL_IMPORTS[family]
+    cls = CLASS_NAMES.get(family, ("", ""))[1 if regression else 0]
+    ctor = ctor.format(cls=cls)
+    if metric == "recall_at_budget":  # 15.3: the share of cases found in the riskiest budget share of rows
+        budget = float(solution.get("alert_budget") or 0.01)
+        metric_import = "average_precision_score"
+        metric_expr = (f"y_true.to_numpy()[np.argsort(-np.asarray(scores), kind='stable')[:max(1, int(np.ceil({budget!r} * len(y_true))))]].sum()"
+                       " / max(int(y_true.sum()), 1)")
+    else:
+        metric_import, metric_expr = METRIC_CODE[metric]
+
+    cells = [
+        _cell("markdown", f"# {project['name']}\n\n"
+              f"**Goal.** {project.get('goal') or '—'}\n\n"
+              + (SYNTHETIC_NOTE + "\n\n" if data.get("synthetic") else "")
+              + f"**Solution draft.** Target `{solution.get('target')}` ({task}). {solution.get('prediction_moment', '')}\n\n"
+              + (f"**Forbidden at prediction time:** " + ", ".join(f"`{c}`" for c in forbidden) + "\n\n" if forbidden else "")
+              + (f"**Identifiers (never features):** " + ", ".join(f"`{c}`" for c in identifiers) + "\n\n" if identifiers else "")
+              + f"**Metric.** {metric}\n\n"
+              "Generated by the DCLab notebook. Every split, metric and selection rule below reproduces the project's approved workflow; "
+              "the holdout is scored once, at the end. Scores are evidence about the method, not production approval."),
+        _cell("code", "import numpy as np\nimport pandas as pd\nfrom sklearn.compose import ColumnTransformer\nfrom sklearn.impute import SimpleImputer\n"
+              "from sklearn.pipeline import Pipeline\nfrom sklearn.preprocessing import OneHotEncoder, StandardScaler\n"
+              f"from sklearn.metrics import {metric_import}\n{import_line}\n\nRANDOM_STATE = 42"),
+        _cell("markdown", "## 1. Load the data and apply the solution\n\nColumns unknown at the prediction moment and identifiers are removed before anything else happens."),
+        _cell("code", f"frame = {_read_code(data.get('filename', 'data.csv'))}  # the project's data file\n"
+              + _labels_code(project, solution)
+              + f"TARGET = {solution.get('target')!r}\nDROP = {drop!r}\n"
+              + _target_code(task, solution, data.get("profile"))
+              + f"X = frame.drop(columns=[TARGET] + [c for c in DROP if c in frame])\nprint(X.shape, y.value_counts(normalize=True).round(3).to_dict() if y.nunique() < 20 else y.describe())"),
+        _cell("markdown", "## 2. Lock the holdout before looking at the target\n\n" + _split_text(time_column, group_column, regression)),
+        _cell("code", _split_code(time_column, group_column, regression, data, _folds(project, records)), role="split"),
+        _cell("markdown", f"## 3. Feature recipe `{recipe}`\n\n{features.get('rule', '')}\n\nEvery statistic (imputation, scaling, one-hot categories) is learned inside the training folds only."),
+        _cell("code", _recipe_code(recipe, time_column, codes, encode_codes)),
+        _cell("markdown", f"## 4. Model `{family}`\n\n{models.get('rule', '')}\n\n"
+              + (f"Tuned parameters accepted: `{params}`" if params else "Default parameters kept (tuning did not beat them by the required margin).")
+              + (f"\n\nKept by a review round on the training folds: `{change}` (a log target, predictions held to the training range, "
+                 "or class weights), replayed below." if change else "")),
+        _cell("code", f"model = {ctor}\n" + (f"model.set_params(**{params!r})\n" if params else "") + _change_code(change)
+              + "pipeline = Pipeline([('features', features), ('model', model)])"
+              + (MULTICLASS_HELPERS if task == "multiclass" else "") + (WEIGHT_HELPER if weighted else "")),
+        _cell("markdown", "## 5. Training-only cross-validation\n\nThe same folds for every comparison; the holdout is still sealed."),
+        _cell("code", _cv_code(task, metric_expr, regression, weighted, clip)),
+        _cell("markdown", "## 6. Score the holdout once\n\nThis is the honest number. Changing the model after seeing it would make the next score optimistic (DCLAB-R17)."),
+        _cell("code", _fit_code(task, "X_train", "y_train", weighted) + "\n" + _score_code(task, metric_expr, clip) + "print('holdout', round(float(holdout), 4))",
+              role="holdout"),
+        _cell("markdown", _result_markdown(records, metric)),
+    ]
+    return {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                                        "language_info": {"name": "python"}, "dclab": {"project": project["id"], "generated_from": "DCLab notebook"}},
+            "nbformat": 4, "nbformat_minor": 5}
+
+
+def _labels_code(project: dict[str, Any], solution: dict[str, Any]) -> str:
+    """15.2: the target from the label file, joined on the key the project checked (a row is a case when its key is there)."""
+    info = project.get("labels") or {}
+    if not info or info.get("target") != solution.get("target"):
+        return ""
+    key = list(info["key"])
+    return (f"labels = {_read_code(info['filename'])}  # the label file, joined on {'+'.join(key)} ({info.get('coverage', 'partial')} labels)\n"
+            f"KEY = {key!r}\n"
+            "marked = frame[KEY].astype(str).merge(labels[KEY].dropna().astype(str).drop_duplicates(), on=KEY, how='left', indicator=True)\n"
+            f"frame[{info['target']!r}] = (marked['_merge'] == 'both').astype(int).to_numpy()\n")
+
+
+def _target_code(task: str, solution: dict[str, Any], profile: Any = None) -> str:
+    if task == "binary":
+        from ..kinds.binary import as_table_label, profile_booleans
+
+        if solution.get("positive_label") is None:  # as the engine: the last value, in order, when the solution names none
+            return ("POSITIVE = str(sorted(frame[TARGET].dropna().unique(), key=str)[-1]).strip()  # the solution names no positive value\n"
+                    "y = (frame[TARGET].astype(str).str.strip() == POSITIVE).astype(int)\n")
+        positive = as_table_label(solution.get("positive_label"), profile_booleans(profile, solution.get("target")))  # as the engine reads it
+        return f"y = (frame[TARGET].astype(str).str.strip() == {str(positive)!r}).astype(int)\n"
+    if task == "multiclass":
+        return "labels = sorted(frame[TARGET].dropna().astype(str).unique())\ny = frame[TARGET].astype(str).map({l: i for i, l in enumerate(labels)}).astype(int)\n"
+    return "y = pd.to_numeric(frame[TARGET], errors='coerce')\nframe = frame[y.notna()].reset_index(drop=True)\ny = y[y.notna()].reset_index(drop=True)\n"
+
+
+def _split_text(time_column: str | None, group_column: str | None, regression: bool) -> str:
+    if time_column:
+        return f"Rows are ordered by `{time_column}`; the last 20% form the holdout and the folds expand forward in time, so nothing learns from the future."
+    if group_column:
+        return f"Rows that share a `{group_column}` stay on the same side of every split, so the model is scored on groups it never saw."
+    return "A random holdout" + ("" if regression else ", stratified on the target") + ", with the training folds drawn only from the remaining rows."
+
+
+def _split_code(time_column: str | None, group_column: str | None, regression: bool, data: dict[str, Any], folds: int = 3) -> str:
+    if time_column:
+        return (f"order = np.argsort(pd.to_datetime(frame[{time_column!r}], errors='coerce').to_numpy().astype('int64') if frame[{time_column!r}].dtype == object else frame[{time_column!r}].to_numpy(), kind='stable')\n"
+                "X, y = X.iloc[order].reset_index(drop=True), y.iloc[order].reset_index(drop=True)\n"
+                "n_test = int(round(0.2 * len(X)))\nX_train, X_test = X.iloc[:-n_test], X.iloc[-n_test:]\ny_train, y_test = y.iloc[:-n_test], y.iloc[-n_test:]\n"
+                f"from sklearn.model_selection import TimeSeriesSplit\ncv = TimeSeriesSplit(n_splits={folds})\ncv_groups = None")
+    if group_column:
+        kf = "GroupKFold" if regression else "StratifiedGroupKFold"
+        return (f"from sklearn.model_selection import {kf}\ngroups = frame[{group_column!r}].to_numpy()\n"
+                f"train_idx, test_idx = next({kf}(n_splits=5{'' if regression else ', shuffle=True, random_state=RANDOM_STATE'}).split(X, y, groups))\n"
+                "X_train, X_test, y_train, y_test = X.iloc[train_idx], X.iloc[test_idx], y.iloc[train_idx], y.iloc[test_idx]\n"
+                f"cv = {kf}(n_splits={folds}{'' if regression else ', shuffle=True, random_state=RANDOM_STATE'})\ncv_groups = groups[train_idx]")
+    kf = "KFold" if regression else "StratifiedKFold"
+    return (f"from sklearn.model_selection import train_test_split, {kf}\n"
+            f"X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, {'' if regression else 'stratify=y, '}random_state=RANDOM_STATE)\n"
+            f"cv = {kf}(n_splits={folds}, shuffle=True, random_state=RANDOM_STATE)\ncv_groups = None")
+
+
+def _recipe_code(recipe: str, time_column: str | None, codes: list[str], encode_codes: bool = True) -> str:
+    derived = ""
+    # The engine one-hot encodes category codes inside each fit fold and never uses them as numbers (DCLAB-R11).
+    head = ("from sklearn.preprocessing import FunctionTransformer\n"
+            f"CATEGORY_CODES = {codes!r}  # numbers that stand for categories: "
+            + ("one-hot encoded, never scaled, logged or multiplied" if encode_codes else "never logged or multiplied") + " (DCLAB-R11)\n"
+            "def as_text(df):\n    return df.astype(object).where(df.notna(), 'missing').astype(str)\n")
+    if recipe in ("log_numeric",):
+        derived = ("def add_logs(df):\n    df = df.copy()\n    for c in df.select_dtypes('number').columns:\n        if c not in CATEGORY_CODES and df[c].nunique() > 2:\n            df[f'log_{c}'] = np.sign(df[c]) * np.log1p(df[c].abs())\n    return df\n")
+    if recipe == "calendar" and time_column:
+        derived = (f"def add_calendar(df):\n    df = df.copy()\n    stamp = pd.to_datetime(frame.loc[df.index, {time_column!r}], errors='coerce')\n"
+                   "    doy = stamp.dt.dayofyear.astype(float)\n    df['doy_sin'], df['doy_cos'] = np.sin(2 * np.pi * doy / 365.25), np.cos(2 * np.pi * doy / 365.25)\n"
+                   "    df['day_of_month'], df['week_of_year'], df['is_weekend'] = stamp.dt.day, stamp.dt.isocalendar().week.astype(float).to_numpy(), (stamp.dt.dayofweek >= 5).astype(float)\n    return df\n")
+    if recipe == "poly2":
+        derived = ("def add_products(df):\n    df = df.copy()\n    cols = [c for c in df.select_dtypes('number').columns if c not in CATEGORY_CODES and df[c].nunique() > 2]\n"
+                   "    for i, a in enumerate(cols):\n        for b in cols[i + 1:]:\n            df[f'{a}*{b}'] = df[a] * df[b]\n    return df\n")
+    pre = (("numeric = [c for c in X_train.select_dtypes('number').columns if c not in CATEGORY_CODES]\n" if encode_codes
+            else "numeric = X_train.select_dtypes('number').columns.tolist()\n") + "categorical = [c for c in X_train.columns if c not in numeric]\n"
+           "preprocess = ColumnTransformer([\n    ('numeric', Pipeline([('impute', SimpleImputer(strategy='median')), ('scale', StandardScaler())]), numeric),\n"
+           "    ('categorical', Pipeline([('as_text', FunctionTransformer(as_text)), ('onehot', OneHotEncoder(handle_unknown='ignore', max_categories=40))]), categorical),\n], remainder='drop')\n")
+    if recipe == "selected_mi":
+        return (head + "\n" + pre + "from sklearn.feature_selection import SelectKBest, mutual_info_classif\n"
+                "features = Pipeline([('preprocess', preprocess), ('select', SelectKBest(mutual_info_classif, k=min(20, len(numeric) + len(categorical))))])")
+    if derived:
+        fn = {"log_numeric": "add_logs", "calendar": "add_calendar", "poly2": "add_products"}[recipe]
+        return head + derived + "\n" + pre.replace("X_train.select_dtypes", f"{fn}(X_train).select_dtypes").replace("X_train.columns", f"{fn}(X_train).columns") + \
+            f"features = Pipeline([('derive', FunctionTransformer({fn})), ('preprocess', preprocess)])"
+    return head + "\n" + pre + "features = preprocess"
+
+
+# A fold (or an early time window) may lack a class: the model learns the classes present as codes 0..m-1 (XGBoost
+# insists on that) and its probabilities are put back in the columns of every class, so argmax is always a class.
+MULTICLASS_HELPERS = """
+
+
+def fit(pipeline, X, y, weighted=False):
+    present = np.unique(y)
+    codes = np.searchsorted(present, y)
+    pipeline.fit(X, codes, **({'model__sample_weight': balanced(codes)} if weighted else {}))
+    pipeline.present_classes = present
+
+
+def class_scores(pipeline, X):
+    scores = np.zeros((len(X), len(labels)))
+    scores[:, pipeline.present_classes] = pipeline.predict_proba(X)
+    return scores"""
+
+
+# Class weights a review round kept: each class weighted against its share of the rows the model is fitted on.
+WEIGHT_HELPER = """
+
+
+def balanced(y):
+    labels, counts = np.unique(y, return_counts=True)
+    share = dict(zip(labels, len(y) / (len(labels) * counts)))
+    return np.array([share[v] for v in y])"""
+
+
+def _change_code(change: dict[str, Any]) -> str:
+    """A log target a review round kept, as scikit-learn's own wrapper (the other changes live in fitting and scoring)."""
+    if change.get("review__target") == "log1p":
+        return ("from sklearn.compose import TransformedTargetRegressor\n"
+                "model = TransformedTargetRegressor(regressor=model, func=np.log1p, inverse_func=np.expm1)  # kept by a review round\n")
+    return ""
+
+
+def _fit_code(task: str, X: str, y: str, weighted: bool = False) -> str:
+    if task == "multiclass":
+        return f"fit(pipeline, {X}, {y}{', weighted=True' if weighted else ''})"
+    return f"pipeline.fit({X}, {y}{f', model__sample_weight=balanced({y})' if weighted else ''})"
+
+
+def _cv_code(task: str, metric_expr: str, regression: bool, weighted: bool = False, clip: bool = False) -> str:
+    score = "pipeline.predict(X_valid)" if regression else ("class_scores(pipeline, X_valid)" if task == "multiclass" else "pipeline.predict_proba(X_valid)[:, 1]")
+    return ("fold_scores = []\nfor fit_idx, valid_idx in cv.split(X_train, y_train, cv_groups) if cv_groups is not None else cv.split(X_train, y_train):\n"
+            f"    {_fit_code(task, 'X_train.iloc[fit_idx]', 'y_train.iloc[fit_idx]', weighted)}\n    X_valid, y_true = X_train.iloc[valid_idx], y_train.iloc[valid_idx]\n"
+            f"    scores = {score}\n"
+            + ("    scores = np.clip(scores, y_train.iloc[fit_idx].min(), y_train.iloc[fit_idx].max())  # held to the fit rows' range\n" if clip else "")
+            + f"    fold_scores.append({metric_expr})\n"
+            "print('CV mean', round(float(np.mean(fold_scores)), 4), 'std', round(float(np.std(fold_scores, ddof=1)), 4))")
+
+
+def _score_code(task: str, metric_expr: str, clip: bool = False) -> str:
+    score = "pipeline.predict(X_test)" if task == "regression" else ("class_scores(pipeline, X_test)" if task == "multiclass" else "pipeline.predict_proba(X_test)[:, 1]")
+    held = "scores = np.clip(scores, y_train.min(), y_train.max())  # held to the training range\n" if clip else ""
+    return f"scores, y_true = {score}, y_test\n{held}holdout = {metric_expr}\n"
+
+
+def _result_markdown(records: dict[str, dict[str, Any]], metric: str) -> str:
+    lines = ["## What the DCLab notebook found", ""]
+    for stage in STAGE_KEYS:
+        record = records.get(stage)
+        if not record:
+            continue
+        lines.append(f"**{record['title']}.** {record['setup_summary']}")
+        for note in record.get("notes", [])[:3]:
+            if note["severity"] != "info":
+                lines.append(f"- *{note['title']}* — {note['text']} (proof: {', '.join(note['proof'])})")
+        lines.append("")
+    final = records.get("final", {}).get("evidence")
+    if final:
+        ci = final["holdout_primary_metric_ci"]
+        lines.append(f"Holdout {metric}: **{final['holdout_metrics'][metric]:.4f}** (95% {ci['low']:.4f}–{ci['high']:.4f}); the holdout was consumed {final.get('holdout_uses_in_this_project', 1)} time(s). Not production-approved.")
+    return "\n".join(lines)
+
+
+def report(project: dict[str, Any], records: dict[str, dict[str, Any]]) -> str:
+    solution = project.get("solution") or {}
+    lines = [f"# {project['name']}", "", f"*Industry:* {project.get('industry', 'general')} · *Created:* {project.get('created', '')[:10]}", "",
+             f"**Goal.** {project.get('goal') or '—'}", "",
+             *([SYNTHETIC_NOTE, ""] if (project.get("data") or {}).get("synthetic") else []),
+             "## Solution draft", "",
+             f"| Item | Value |", "|---|---|", f"| Target | `{solution.get('target')}` ({solution.get('task')}) |",
+             f"| Prediction moment | {solution.get('prediction_moment', '')} |",
+             f"| Forbidden columns | {', '.join('`' + f['column'] + '`' for f in solution.get('forbidden', [])) or 'none'} |",
+             f"| Identifiers | {', '.join('`' + c + '`' for c in solution.get('identifiers', [])) or 'none'} |",
+             f"| Time / group column | {solution.get('time_column') or '—'} / {solution.get('group_column') or '—'} |",
+             f"| Metric | {solution.get('metric') or 'default for the task'} |", ""]
+    for index, stage in enumerate(STAGE_KEYS, 1):
+        record = records.get(stage)
+        if not record:
+            continue
+        lines += [f"## {index}. {record['title']}", "", f"*{record['question']}*", "", record["setup_summary"], ""]
+        for claim in record["claims"]:
+            lines.append(f"- **{claim['kind']}** — {claim['statement']}")
+            for limit in claim.get("limitations", []):
+                lines.append(f"  - limitation: {limit}")
+        decision = record.get("decision")
+        if decision and decision.get("options"):
+            lines += ["", f"Decision: `{decision['chosen']}`" + (" (chosen by the person; the rule selected `" + decision["selected"] + "`)" if decision.get("overridden") else " (by the selection rule)"), ""]
+        lines += ["", "Agent notes:", ""]
+        for note in record.get("notes", []):
+            lines.append(f"- [{note['severity']}] **{note['title']}** — {note['text']} _(proof: {', '.join(note['proof']) or '—'})_")
+        lines.append("")
+    lines += ["---", "", "Generated by the DCLab notebook. Research evidence is not production approval (DCLAB-R22)."]
+    return "\n".join(lines)
+
+
+def dumps_notebook(nb: dict[str, Any]) -> str:
+    return json.dumps(nb, indent=1, ensure_ascii=False)

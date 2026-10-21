@@ -1,0 +1,359 @@
+"""What the existing writers already record, emitted into the experience log as well (package 19.3).
+
+The audit trail, the drafts' events, the projects' activity, the agents' traces and the model gateway each keep their
+own store for their own readers; each also calls one function here, which maps its record onto the vocabulary of
+``dclab_core.experience`` and records it with the ids it knows. A record the vocabulary has no kind for is skipped;
+a mapping that fails is reported and skipped: a writer never fails because of its experience event.
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import Any, Callable
+
+from . import model_text_allowed, now, record
+
+
+def _quiet(fn: Callable[..., Any]) -> Callable[..., Any]:
+    def run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the writer's own record stands; its experience event is skipped
+            print(f"experience: {fn.__name__} skipped ({type(exc).__name__})", file=sys.stderr, flush=True)
+            return None
+    run.__name__ = fn.__name__
+    return run
+
+
+def _actor(actor: Any) -> str:
+    return "agent" if actor == "agent" else "system" if actor == "system" else "person"
+
+
+@_quiet
+def from_audit(row: dict[str, Any]) -> None:
+    """An audit row (its arguments under ``detail.args``, its words under ``detail.message``): a validated move, a
+    saved solution, a project's data import, an approval, a policy or a routing change, a lesson review, a removed note.
+    A draft's own upload and the copies a build makes are recorded once, by the draft's events, not again here."""
+    kind, detail = row.get("kind"), row.get("detail") or {}
+    args = detail.get("args") if isinstance(detail.get("args"), dict) else {}
+    ids = {"project": row.get("project_id"), "conversation": row.get("draft_id"), "user": row.get("user_id")}
+    actor = _actor(row.get("actor"))
+    if kind == "move":
+        record("graph.move", actor, {"move": row.get("move"), "allowed": row.get("status") == "allowed",
+                                     "from": detail.get("from"), "to": detail.get("to"),
+                                     "failed_checks": [str(c)[:80] for c in detail.get("failed_checks") or []][:20] or None,
+                                     "rules": [str(r)[:40] for r in detail.get("rules") or []][:20] or None}, **ids)
+    elif kind == "solution":
+        if detail.get("built"):  # the draft's solution copied into its project at build: saved once, in the draft
+            return
+        record("solution.saved", actor, {"target": detail.get("target"), "task": detail.get("task"),
+                                         "forbidden": [str(c)[:120] for c in detail.get("forbidden") or []][:200] or None}, **ids)
+    elif kind == "data_import":
+        source = detail.get("source") if isinstance(detail.get("source"), dict) else {}
+        if row.get("draft_id") or source.get("kind") == "draft":  # the draft's upload is its own event; the build's copy is no upload
+            return
+        record("data.uploaded", actor, {"name": str(detail.get("filename") or "")[:200] or None, "rows": detail.get("rows"),
+                                        "columns": detail.get("columns"), "source": str(source.get("kind") or "")[:40] or None}, **ids)
+    elif kind == "approval":
+        record("decision.accepted", actor, {"point": f"gate:{str(args.get('gate') or '')[:60]}", "by": actor}, **ids)
+    elif kind == "policy":
+        record("decision.accepted", actor, {"point": f"policy:{str(args.get('policy') or '')[:60]}", "choice": "on" if args.get("on") else "off",
+                                            "by": actor}, **ids)
+    elif kind == "routing":
+        record("decision.accepted", actor, {"point": f"routing:{str(args.get('purpose') or '')[:60]}",
+                                            "choice": {k: str(args.get(k))[:80] for k in ("setting", "from", "to") if args.get(k) is not None} or None,
+                                            "by": actor}, **ids)
+    elif kind == "brief":  # 30.14: the person's brief, by its fingerprint (the words stay in the project)
+        record("decision.accepted", actor, {"point": "solution.brief", "choice": str(args.get("fingerprint") or "")[:16] or None, "by": actor}, **ids)
+    elif kind == "lesson_review":
+        accepted = str(args.get("action") or "").startswith("accept")
+        if accepted:
+            record("decision.accepted", actor, {"point": "lesson", "choice": str(args.get("lesson") or "")[:60] or None, "by": actor}, **ids)
+        else:
+            record("decision.refused", actor, {"point": "lesson", "choice": str(args.get("lesson") or "")[:60] or None, "rule": "person",
+                                               "reason": str(detail.get("message") or "")[:2000] or None}, **ids)
+    elif kind == "memory_removed":
+        record("decision.overridden", actor, {"point": "memory", "proposed": str(args.get("note") or "")[:60] or None,
+                                              "reason": str(detail.get("message") or "")[:2000] or None}, **ids)
+
+
+@_quiet
+def from_draft_event(draft_id: str, kind: str, data: dict[str, Any] | None) -> None:
+    """A draft's event (Home): the chat, the data pipeline, the analysis, the build."""
+    data = data or {}
+    ids = {"conversation": draft_id}
+    if kind == "chat":
+        message = data
+        text = message.get("text")
+        if message.get("role") == "user":
+            record("chat.person", "person", {"text": text, "surface": "home"}, **ids)
+        elif message.get("role") == "agent":
+            question = message.get("question") or {}
+            from . import last_model_request, release
+
+            record("chat.agent", "agent", {"text": text, "kind": message.get("kind"), "question_field": question.get("field"),
+                                           "options": [str(o)[:120] for o in question.get("options") or []][:12] or None,
+                                           "surface": "home", "message": str(message.get("id") or "")[:80] or None, "version": release(),
+                                           "question_source": str(question.get("source"))[:40] if question.get("source") else None},  # 28.4: "critic"
+                   model_request=last_model_request() if message.get("by") == "model" else None, **ids)  # 23.10: only a reply a model wrote joins its request
+    elif kind == "pipeline":
+        step, asset = data.get("step"), data.get("asset")
+        if step == "queued" and isinstance(asset, dict):
+            record("data.uploaded", "person", {"name": str(asset.get("name") or "")[:200] or None, "bytes": asset.get("bytes"),
+                                               "source": asset.get("kind")}, **ids)
+        elif step == "failed":
+            record("error.raised", "system", {"where": "data pipeline", "code": str(data.get("code") or "pipeline_failed")[:80],
+                                              "message": str(data.get("text") or data.get("error") or "")[:2000] or None,
+                                              "fingerprint": data.get("fingerprint"), "frame": data.get("frame")}, **ids)
+        elif step == "cleaned":
+            log = data.get("log") or []
+            record("data.cleaned", "system", {"steps": len(log), "rows_before": (log[0] or {}).get("rows_before") if log else None,
+                                              "rows_after": (log[-1] or {}).get("rows_after") if log else None}, **ids)
+    elif kind == "analysis":
+        analysis = data.get("analysis") or {}
+        profile = analysis.get("profile") or {}
+        columns = profile.get("columns") or []
+        roles = {str(c.get("name"))[:120]: _role(c) for c in columns[:200]}
+        record("data.analysed", "system", {"rows": profile.get("rows"), "columns": profile.get("column_count") or len(columns),
+                                           "column_names": [str(c.get("name"))[:120] for c in columns][:200] or None,
+                                           "roles": roles or None,
+                                           "sensitivity": {str(c.get("name"))[:120]: c["sensitivity"] for c in columns[:200]
+                                                           if c.get("sensitivity") not in (None, "none")} or None}, **ids)
+        cases = analysis.get("cases_table")
+        if cases:
+            record("data.cases_found", "system", {"keys": cases.get("keys"), "case_kinds": sorted(cases.get("case_kinds") or {}),
+                                                  "tables_matched": len(cases.get("tables") or [])}, **ids)
+    elif kind == "status" and data.get("built"):
+        record("draft.built", "person", {"project": data.get("project_id")}, project=data.get("project_id"), **ids)
+
+
+def _role(column: dict[str, Any]) -> str:
+    for flag, role in (("id_like", "identifier"), ("time_like", "time"), ("text_like", "text"), ("target_name_like", "outcome-like")):
+        if column.get(flag):
+            return role
+    return str(column.get("kind") or "column")
+
+
+@_quiet
+def from_activity(project_id: str, kind: str, payload: Any) -> None:
+    """A project's activity: its stages, its data and labels, a question asked of its agent."""
+    p = payload if isinstance(payload, dict) else {}
+    ids = {"project": project_id}
+    if kind == "stage_started":
+        record("stage.started", "system", {"stage": p.get("stage")}, **ids)
+    elif kind == "stage_completed":
+        record("stage.finished", "system", {"stage": p.get("stage"), "seconds": p.get("elapsed_seconds"), "metric": p.get("metric"),
+                                            "value": p.get("value"), "chosen": p.get("chosen")}, **ids)
+    elif kind == "stage_failed":
+        record("stage.failed", "system", {"stage": p.get("stage"), "error": str(p.get("error") or "")[:2000] or None, "code": p.get("code"),
+                                          "fingerprint": p.get("fingerprint"), "frame": p.get("frame")}, **ids)
+    elif kind == "stage_approved":
+        record("stage.approved", "person", {"stage": p.get("stage"), "choice": p.get("choice")}, **ids)
+    elif kind == "labels_attached":
+        record("data.labels_joined", "system", {"key": p.get("key"), "rows_marked": p.get("rows_marked"),
+                                                "label_rows": p.get("label_rows"), "not_found": p.get("not_found")}, **ids)
+    elif kind == "question":
+        record("chat.person", "person", {"text": p.get("question"), "surface": "project"}, **ids)
+    elif kind == "answer":
+        from . import release
+
+        record("chat.agent", "agent", {"text": p.get("answer"), "kind": "answer", "surface": "project", "version": release()}, **ids)
+
+
+@_quiet
+def from_trace(row: dict[str, Any]) -> None:
+    """One agent step (the Home agent, the intern, the campaign): the step, and its tool call when it made one."""
+    ids = {"run": row.get("run_id")}
+    if str(row.get("agent") or "").split(".")[0] in ("home", "intern"):  # their run is the conversation (21.1: script and plan too)
+        ids["conversation"] = row.get("run_id")
+    from . import last_model_request
+
+    from .. import observe
+
+    with observe.span():  # 23.11: the step is a span; its tool call, below, a span inside it
+        record("agent.step", "agent", {"agent": row.get("agent"), "n": row.get("n"), "state": str(row.get("state") or "")[:300] or None,
+                                       "reply": text if isinstance(text := row.get("reply_text"), str) and text else None, "tool": row.get("tool"),
+                                       "verdict": row.get("verdict"), "seconds": row.get("seconds")},
+               model_request=row.get("model_request") or (last_model_request() if row.get("reply") is not None else None), **ids)  # only a model's reply joins its request
+        if row.get("tool"):
+            arguments = row.get("arguments")
+            names = sorted(arguments)[:50] if isinstance(arguments, dict) else None
+            with observe.span():
+                record("tool.call", "agent", {"tool": row.get("tool"), "argument_names": names, "arguments": arguments if isinstance(arguments, dict) else None,
+                                              "verdict": row.get("verdict"), "result": row.get("result")}, **ids)
+
+
+@_quiet
+def from_model_request(entry: dict[str, Any], messages: list[dict[str, Any]] | None = None, reply: str | None = None) -> None:
+    """One model request through the gateway: what it cost, and its prompt and reply when the workspace keeps them."""
+    from ..models import settings as model_settings
+
+    try:  # a purpose shown cell values (the parser's sample lines, the intern's tool results) keeps no prompt or reply
+        shown_cells = int(getattr(model_settings.purpose(str(entry.get("purpose"))), "cell_values", 0) or 0) > 0
+    except Exception:  # noqa: BLE001 - an unknown purpose is treated as one shown cells
+        shown_cells = True
+    keep = model_text_allowed() and not shown_cells
+    prompt = "\n\n".join(f"{m.get('role')}: {m.get('content')}" for m in messages or [] if isinstance(m.get("content"), str)) if keep else None
+    record("model.request", "model", {"purpose": entry.get("purpose"), "tier": entry.get("tier"), "model": entry.get("model"),
+                                      "input_tokens": entry.get("input_tokens"), "output_tokens": entry.get("output_tokens"),
+                                      "cache_read_tokens": entry.get("cache_read_tokens") or None, "cache_write_tokens": entry.get("cache_write_tokens") or None,
+                                      "cost": entry.get("cost_eur"), "currency": "EUR" if entry.get("cost_eur") is not None else None,
+                                      "seconds": entry.get("seconds"), "outcome": entry.get("outcome"),
+                                      "prompt": prompt[:20000] if prompt else None, "reply": (reply or None) if keep else None},
+           project=entry.get("project_id"), conversation=entry.get("draft_id"), model_request=entry.get("id"), run=entry.get("run"))
+
+
+@_quiet
+def from_model_check(purpose: str, tier: Any, model: str, passed: bool, reason: str | None) -> None:
+    """The verdict of the code that checks a model's reply (23.10), under the id of the request it answered."""
+    from . import last_model_request
+
+    record("model.checked", "system", {"purpose": purpose, "tier": tier, "model": model, "passed": "yes" if passed else "no", "reason": (reason or "")[:300] or None},
+           model_request=last_model_request())
+
+
+@_quiet
+def settings_changed(changes: dict[str, Any], **ids: Any) -> None:
+    """A person changed how a draft or a project runs (split, folds, quick, rows, budget): a decision, with its values."""
+    choice = {str(k)[:40]: v if isinstance(v, (bool, int, float)) or v is None else str(v)[:80] for k, v in changes.items()
+              if not isinstance(v, (dict, list))}
+    if choice:
+        record("decision.accepted", "person", {"point": "settings", "choice": choice, "by": "person"}, **ids)
+
+
+# ---------------------------------------------------------------------- 19.5: runs other than a project's stages
+
+def _run_event(done: Any, **ids: Any) -> None:
+    from dclab_core.lineage import event_payload
+
+    record("run.recorded", "system", event_payload(done), **ids)
+
+
+@_quiet
+def from_agent_run(policy: Any, result: Any, trace: Any, started: str, seconds: float, error: str | None = None,
+                   interrupted: bool = False) -> None:
+    """One ``agents.run()`` call (the Home agent's turn, the intern's, the campaign's phase) as a run: what it was
+    allowed (its budget and tools), how it ended, its steps and tokens, the code and prompts it ran with."""
+    from . import contract, current_log
+
+    if contract is None or current_log() is None:  # nothing kept: no record built
+        return
+    from dclab_core import lineage
+
+    from ..studio.lineage import code, new_run
+
+    stopped = getattr(result, "stopped", None)
+    status = "stopped" if interrupted or stopped in ("steps", "time", "replies") else "failed" if error else "completed"
+    usage = getattr(result, "usage", None) or {}
+    numbers = {"steps": float(len(getattr(result, "steps", None) or [])), **{k: float(v) for k, v in usage.items()}}
+    done = lineage.RunRecord(run=new_run(), kind="agent", name=str(policy.name)[:120], parent=getattr(trace, "run_id", None),
+                               status=status, started=started, finished=now(), seconds=max(seconds, 0.0),
+                               params={"max_steps": policy.max_steps, "max_seconds": policy.max_seconds, "max_replies": policy.max_replies,
+                                       "tools": len(policy.tools)},
+                               outputs=lineage.RunOutputs(chosen=stopped, numbers=numbers), code=code("dclabai.agents.runtime"),
+                               error=(error or None) and error[:600])
+    ids = {"run": getattr(trace, "run_id", None)}
+    if getattr(trace, "agent", None) in ("home", "intern"):  # as its steps (from_trace): the conversation is the run
+        ids["conversation"] = ids["run"]
+    _run_event(done, **ids)
+
+
+@_quiet
+def from_agent_session(agent: str, current: Any, started: str, seconds: float, error: str | None = None,
+                       interrupted: bool = False, params: dict[str, Any] | None = None) -> None:
+    """One run of an agent outside a model loop (21.1: the Home agent's script, the intern's standard plan, the team,
+    the campaign, an MCP client's calls) as a run, like a loop's: how it ended, its steps, the code it ran with."""
+    from . import contract, current_log
+
+    if contract is None or current_log() is None:
+        return
+    from dclab_core import lineage
+
+    from ..studio.lineage import code, new_run
+
+    status = "stopped" if interrupted else (getattr(current, "status", None) or ("failed" if error else "completed"))  # the caller's word first
+    numbers = {"steps": float(current.steps), "failed_steps": float(current.failed), **{k: float(v) for k, v in current.usage.items()}}
+    done = lineage.RunRecord(run=new_run(), kind="agent", name=str(agent)[:120], parent=current.run_id, status=status, started=started,
+                               finished=now(), seconds=max(seconds, 0.0),
+                               params={k: v for k, v in (params or {}).items() if isinstance(v, (int, float, str, bool))},
+                               outputs=lineage.RunOutputs(chosen=status, numbers=numbers), code=code("dclabai.agents.harness"),
+                               error=(error or None) and error[:600])
+    ids = {"run": current.run_id}
+    if agent.split(".")[0] in ("home", "intern"):
+        ids["conversation"] = current.run_id
+    _run_event(done, **ids)
+
+
+@_quiet
+def from_draft_pipeline(draft_id: str, asset: dict[str, Any], final: dict[str, Any], path: Any, run: str, started: str, seconds: float) -> None:
+    """One asset through a draft's pipeline (structure → clean → analyse) as a run: the file it read (by hash), how it
+    was read, the table it made, or why it failed."""
+    from . import contract, current_log
+
+    if contract is None or current_log() is None:
+        return
+    import hashlib
+
+    from dclab_core import lineage
+
+    from ..studio.lineage import code
+
+    digest = final.get("raw_sha256") or asset.get("raw_sha256")  # the upload's hash as the pipeline recorded it
+    if not digest:
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            digest = None
+    ready, stopped = final.get("status") == "ready", final.get("status") == "stopped"
+    numbers = {k: float(final[k]) for k in ("rows", "columns") if isinstance(final.get(k), (int, float))}
+    done = lineage.RunRecord(run=run, kind="pipeline", name="draft_pipeline", draft=draft_id,
+                             status="completed" if ready else "stopped" if stopped else "failed",
+                               started=started, finished=now(), seconds=max(seconds, 0.0),
+                               inputs=lineage.RunInputs(data_sha256=digest, refs={"asset": str(asset.get("id"))}),
+                               params={"kind": asset.get("kind"), "format": final.get("format")},
+                               outputs=lineage.RunOutputs(chosen=final.get("status"), numbers=numbers), code=code("dclabai.draft.pipeline"),
+                               error=None if ready else str(final.get("error") or "")[:600] or None)
+    _run_event(done, conversation=draft_id, run=run)
+
+
+# ------------------------------------------------------------------------------------------------------------ a problem of several parts (24.7)
+
+@_quiet
+def map_drawn(draft_id: str, m: Any, by_model: bool) -> None:
+    """The problem map drawn (or drawn again): its fingerprint, size and the families of its sub-problems. Names and counts; the person's words are not in it."""
+    record("problem.mapped", "model" if by_model else "system",
+           {"map": m.fingerprint, "size": m.size, "template": m.template or "none", "source": m.source, "by": "decomposer" if by_model else "rules",
+            "parts": len(m.parts), "sub_problems": len(m.sub_problems), "families": [str(x.family) for x in m.sub_problems][:40]}, conversation=draft_id)
+
+
+@_quiet
+def map_changed(draft_id: str, held: Any, made: Any, action: str, who: str, part: str | None = None, reason: str | None = None) -> None:
+    """A person's change to the map (add, remove, merge, confirm): what they did, and how many parts there were before and after."""
+    import re
+
+    part = part if isinstance(part, str) and re.fullmatch(r"(part|blk)\d{1,3}", part) else None  # an id: a title a person typed is their words, and is not meta
+    record("problem.part_changed", "person", {"map": made.fingerprint, "action": action, "part": part, "by": who, "parts_before": len(held.parts),
+                                              "parts_after": len(made.parts), "reason": (reason or "")[:2000] or None}, conversation=draft_id)
+
+
+@_quiet
+def route_made(draft_id: str, map_fingerprint: str, sub: Any, route: Any) -> None:
+    """The approach routed to one sub-problem, with the candidates and the ones the data card or the map refuted."""
+    record("solution.routed", "model" if route.source == "advisor" else "system",
+           {"map": map_fingerprint, "sub_problem": sub.id, "family": str(sub.family), "chosen": route.chosen, "source": route.source,
+            "candidates": [c.approach for c in route.candidates][:16], "blocked": [c.approach for c in route.candidates if c.blocking][:16]}, conversation=draft_id)
+
+
+@_quiet
+def programme_built(project_id: str, p: Any, actor: str) -> None:
+    """A programme run: the composition chosen on validation (when it was) and the programme's state with the numbers of its one read of the holdout (when it was read)."""
+    c, h = p.composition, p.holdout
+    built = [l for l in p.leaves if l.status == "built"]
+    if c is not None:
+        record("solution.composed", "system", {"programme": p.fingerprint, "solution": p.solution, "chosen": c.chosen, "best_leaf": c.best_leaf, "leaves": len(c.weights),
+                                               "positives": c.positives, "best_leaf_score": c.best_leaf_score, "chosen_score": c.candidates.get(c.chosen)}, project=project_id)
+    record("programme.built", _actor(actor), {"programme": p.fingerprint, "state": p.state, "metric": p.metric, "holdout_read": "yes" if h is not None else "no",
+                                              "leaves_built": len(built), "leaves_blocked": sum(1 for l in p.leaves if l.status == "blocked"),
+                                              "composed": h.composed.value if h else None, "best_leaf": h.best_leaf_estimate.value if h else None,
+                                              "difference": h.difference.value if h else None, "low": h.difference.low if h else None, "high": h.difference.high if h else None,
+                                              "beats_best_leaf": ("yes" if h.beats_best_leaf else "no") if h else None}, project=project_id)

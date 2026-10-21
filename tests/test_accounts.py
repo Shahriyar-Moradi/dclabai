@@ -1,0 +1,454 @@
+"""Accounts, workspaces and roles (package 10.2), with password sign-in on PostgreSQL.
+
+Two workspaces and a member of each role. Every write route is called by someone whose role may not, and by a member
+of the other workspace with this workspace's ids: neither changes anything. A viewer cannot run a stage or approve a
+gate, a user never sees another workspace, and a gate approval names the person who approved it."""
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+import pgtest  # noqa: E402
+
+PASSWORD = "a long enough password"
+WRITES = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+class AccountsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastapi.testclient import TestClient
+
+            from dclabai.agentic.server import create_app
+        except ImportError as error:
+            raise unittest.SkipTest(f"Studio dependencies not installed: {error}")
+        url = pgtest.require()
+        pgtest.empty(url)  # this file's workspaces only: a second run starts from nothing
+        cls.env = mock.patch.dict(os.environ, {"DCLAB_DATABASE_URL": url, "DCLAB_AUTH": "password", "OPENAI_API_KEY": "",
+                                               "DCLAB_LLM_BASE_URL": "https://api.openai.com/v1"})
+        cls.env.start()
+        from dclabai.storage import db
+
+        db.upgrade(url)
+        from dclabai.accounts.store import Accounts
+
+        cls.TestClient = TestClient
+        cls.app = create_app(Path(tempfile.mkdtemp()))
+        cls.main = TestClient(cls.app)
+        cls.main.__enter__()
+        cls.accounts = Accounts()
+        cls.w1 = cls.app.state.services.workspace_id
+        cls.w2 = cls.accounts.create_workspace("Other team")
+        cls.users = {}
+        for name, workspace, role in (("owner1", cls.w1, "owner"), ("ds1", cls.w1, "data_scientist"), ("rev1", cls.w1, "reviewer"),
+                                      ("view1", cls.w1, "viewer"), ("owner2", cls.w2, "owner"), ("ds2", cls.w2, "data_scientist")):
+            user = cls.accounts.create_user(f"{name}-{os.getpid()}@example.com", name.title(), password=PASSWORD)
+            cls.accounts.set_member(workspace, user["id"], role)
+            cls.users[name] = user
+        cls.clients = {name: cls.sign_in(name) for name in cls.users}
+        # the first workspace's things, made by its owner
+        s1 = cls.app.state.services
+        with cls.as_user("owner1"):
+            cls.project = s1.projects.create("Churn W1", "general", "Predict churn")
+            cls.draft = s1.drafts.create("Predict which customers churn next month")
+            cls.session = s1.intern_sessions.create("Review the churn project", mode="standard", model=None, project_id=cls.project["id"])
+        cls.job = s1.job_store.enqueue("stage", "w1-key", {"project_id": cls.project["id"], "stages": ["data"]}, worker="w")
+        s1.job_store.finish(cls.job["id"], "failed", "boom")
+        cls.lesson = s1.lesson_store.save({"id": "lw1abc", "project_id": cls.project["id"], "status": "proposed", "claim": "c", "against": "a",
+                                           "next_test": "n", "cites": [], "scope": {}, "synthetic": False, "proposed_at": "2026-10-07T10:00:00+00:00"})
+        s1.store.create("runw1", {"goal": "g", "datasets": []})
+        token, record = cls.accounts.create_token(cls.users["owner1"]["id"], cls.w1, "laptop")
+        cls.token, cls.token_record = token, record
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.main.__exit__(None, None, None)
+        cls.env.stop()
+
+    @classmethod
+    def sign_in(cls, name):
+        client = cls.TestClient(cls.app)
+        anonymous = client.get("/api/config").json()["csrf"]
+        r = client.post("/api/auth/password", json={"email": cls.users[name]["email"], "password": PASSWORD}, headers={"X-DCLab-Token": anonymous})
+        assert r.status_code == 200, r.text
+        client.headers["X-DCLab-Token"] = r.json()["csrf"]
+        return client
+
+    @classmethod
+    def as_user(cls, name):
+        from dclabai.accounts.principal import Principal, acting
+
+        user = cls.users[name]
+        return acting(Principal(role="owner", workspace_id=cls.w1, user_id=user["id"], email=user["email"], name=user["name"], via="test"))
+
+    def ids(self):
+        return {"project_id": self.project["id"], "stage": "data", "note_id": "n1", "draft_id": self.draft["id"], "session_id": self.session["id"],
+                "job_id": self.job["id"], "lesson_id": self.lesson["id"], "run_id": "runw1", "token_id": self.token_record["id"],
+                "user_id": self.users["ds1"]["id"]}
+
+    def snapshot(self):
+        s1 = self.app.state.services
+        return (json.dumps(s1.projects.get(self.project["id"]), sort_keys=True, default=str),
+                json.dumps({k: v for k, v in s1.drafts.get(self.draft["id"]).items() if k != "updated"}, sort_keys=True, default=str),
+                json.dumps(s1.intern_sessions.get(self.session["id"]), sort_keys=True, default=str),
+                s1.job_store.get(self.job["id"])["status"], s1.lesson_store.get(self.lesson["id"])["status"],
+                sorted((m["id"], m["role"]) for m in self.accounts.members(self.w1)), len(self.accounts.tokens(self.users["owner1"]["id"])))
+
+    # ------------------------------------------------------------------ the package's "Done when"
+    def test_every_write_route_refuses_the_wrong_role_and_the_wrong_workspace(self):
+        from dclabai.accounts.guard import permission
+        from dclabai.agentic.api_models import api_routes
+
+        wrong_role = {"write": "view1", "approve_stage": "view1", "approve_gate": "ds1", "review": "ds1", "admin": "ds1", "timelines": "ds1"}
+        before, ids, checked = self.snapshot(), self.ids(), []
+        for route in api_routes(self.app):
+            for method in sorted(route.methods & WRITES):
+                needed = permission(method, route.path)
+                path = re.sub(r"\{(\w+)\}", lambda m: ids.get(m.group(1), "x"), route.path)
+                if needed in wrong_role:  # someone in this workspace whose role may not
+                    r = self.clients[wrong_role[needed]].request(method, path, json={})
+                    self.assertEqual(r.status_code, 403, f"{method} {route.path} as {wrong_role[needed]}: {r.status_code} {r.text[:200]}")
+                    self.assertEqual(r.json()["detail"]["error"], "role", route.path)
+                if "{" in route.path and needed != "public":  # a member of the other workspace, with this workspace's ids
+                    r = self.clients["owner2"].request(method, path, json={})
+                    self.assertNotEqual(r.status_code // 100, 2, f"{method} {route.path} from the other workspace: {r.status_code} {r.text[:200]}")
+                checked.append(f"{method} {route.path}")
+        self.assertEqual(self.snapshot(), before)  # nothing in the first workspace changed
+        self.assertGreater(len(checked), 45)
+
+    def test_a_viewer_cannot_read_a_whole_table_and_build_it_works_in_every_workspace(self):
+        """25.13 review: the table's values are the project's data (as export/code); "build it" is wired in each workspace."""
+        from dclabai.accounts.guard import permission
+
+        for path in ("/api/drafts/{draft_id}/assets/{asset_id}/download", "/api/drafts/{draft_id}/assets/{asset_id}/rows"):
+            self.assertEqual(permission("GET", path), "write")
+            r = self.clients["view1"].get(path.replace("{draft_id}", self.draft["id"]).replace("{asset_id}", "x"))
+            self.assertEqual(r.status_code, 403, r.text[:200])
+        other = self.app.state.pool.get(self.w2)
+        self.assertIsNotNone(getattr(other, "build_from_chat", None))
+        self.assertIs(other.build_from_chat, self.app.state.pool.default.build_from_chat)
+
+    def test_a_viewer_cannot_run_a_stage_or_approve_a_gate(self):
+        pid = self.project["id"]
+        viewer, reviewer, scientist = self.clients["view1"], self.clients["rev1"], self.clients["ds1"]
+        self.assertEqual(viewer.post(f"/api/projects/{pid}/stages/data/run", json={}).status_code, 403)
+        self.assertEqual(viewer.post(f"/api/projects/{pid}/run").status_code, 403)
+        self.assertEqual(viewer.post(f"/api/projects/{pid}/approvals", json={"gate": "holdout", "reason": "ok"}).status_code, 403)
+        self.assertEqual(scientist.post(f"/api/projects/{pid}/approvals", json={"gate": "holdout", "reason": "ok"}).status_code, 403)
+        self.assertEqual(viewer.get(f"/api/projects/{pid}").status_code, 200)  # a viewer reads
+        self.assertNotEqual(reviewer.post(f"/api/projects/{pid}/stages/data/approve", json={}).status_code, 403)  # the stage's choice: reviewer too
+        # gate switches and the training opt-in are the owner's
+        self.assertEqual(scientist.patch(f"/api/projects/{pid}", json={"policy": {"require_holdout_approval": True}}).status_code, 403)
+        self.assertEqual(scientist.patch(f"/api/projects/{pid}", json={"settings": {"consent": {"train": True}}}).status_code, 403)  # 19.10
+        self.assertEqual(scientist.patch(f"/api/projects/{pid}", json={"name": "Churn W1"}).status_code, 200)
+
+    def test_a_user_never_sees_another_workspace(self):
+        other = self.clients["ds2"]
+        created = other.post("/api/projects", json={"name": "W2 project", "goal": "g"})
+        self.assertEqual(created.status_code, 201, created.text)
+        mine = {p["id"] for p in other.get("/api/projects").json()}
+        theirs = {p["id"] for p in self.clients["owner1"].get("/api/projects").json()}
+        self.assertIn(created.json()["id"], mine)
+        self.assertNotIn(self.project["id"], mine)
+        self.assertNotIn(created.json()["id"], theirs)
+        for path in (f"/api/projects/{self.project['id']}", f"/api/drafts/{self.draft['id']}", f"/api/intern/sessions/{self.session['id']}",
+                     f"/api/jobs/{self.job['id']}"):
+            self.assertEqual(other.get(path).status_code, 404, path)
+        self.assertNotIn(self.draft["id"], {d["id"] for d in other.get("/api/drafts").json()})
+        audit = other.get("/api/platform/audit").json()
+        self.assertFalse(any((e.get("project") or {}).get("id") == self.project["id"] for e in audit["items"]))
+
+    def test_a_gate_approval_names_the_person(self):
+        s1 = self.app.state.services
+        p = s1.projects.get(self.project["id"])
+        p["solution"] = {"target": "y", "task": "binary"}
+        s1.projects.save(p)
+        r = self.clients["rev1"].post(f"/api/projects/{self.project['id']}/approvals", json={"gate": "holdout", "reason": "split checked"})
+        self.assertEqual(r.status_code, 200, r.text)
+        approval = s1.projects.get(self.project["id"])["approvals"][-1]
+        self.assertEqual((approval["user_id"], approval["by"], approval["role"]), (self.users["rev1"]["id"], "Rev1", "reviewer"))
+        row = next(e for e in self.clients["owner1"].get("/api/platform/audit?kind=approval").json()["items"] if e["at"] == approval["at"])
+        self.assertEqual((row["user_id"], row["who"]), (self.users["rev1"]["id"], "Rev1"))
+
+    def test_pages_load_and_the_schema_is_not_served(self):
+        anonymous = self.TestClient(self.app)
+        for path in ("/", "/guide"):
+            self.assertEqual(anonymous.get(path).status_code, 200, path)  # the shell: no data; the sign-in page lives here (part C)
+            self.assertEqual(self.clients["view1"].get(path).status_code, 200, path)
+        self.assertEqual(anonymous.get("/openapi.json").status_code, 404)  # FastAPI's own routes are outside the role check
+        self.assertEqual(anonymous.get("/docs").status_code, 404)
+        self.assertEqual(anonymous.get("/healthz").status_code, 200)  # a load balancer's probes carry no session (12.4)
+        self.assertEqual(anonymous.get("/readyz").json()["checks"]["database"], "ok")
+
+    def test_the_home_agent_and_the_jobs_of_a_second_workspace_run_there(self):
+        other = self.clients["owner2"]
+        # Through the client whose event loop stays up (entered in setUpClass), with owner2's session: the Home agent
+        # starts as a task on the request's loop, and a client that was never entered closes that loop with the response,
+        # so on a busy runner the task was cancelled before it began (as under uvicorn, the loop must outlive the request).
+        draft = self.main.post("/api/drafts", json={"problem": "Predict which invoices are paid late"}, cookies=other.cookies,
+                               headers={"X-DCLab-Token": other.headers["X-DCLab-Token"]}).json()
+        deadline = time.time() + 120
+        while time.time() < deadline and not other.get(f"/api/drafts/{draft['id']}").json()["messages"]:
+            time.sleep(0.2)
+        state = other.get(f"/api/drafts/{draft['id']}").json()
+        self.assertTrue(state["messages"], {k: state.get(k) for k in ("status", "agent", "events_seq")})  # the agent answered, in this workspace
+        self.assertEqual(other.post(f"/api/drafts/{draft['id']}/pack", json={"key": "auto"}).status_code, 200)
+        csv = b"days,amount,late\n" + b"".join(f"{i % 60},{100 + i},{i % 4 == 0}\n".encode() for i in range(120))
+        asset = other.put(f"/api/drafts/{draft['id']}/data?filename=i.csv", content=csv).json()
+        while time.time() < deadline + 120:
+            found = next(a for a in other.get(f"/api/drafts/{draft['id']}").json()["assets"] if a["id"] == asset["id"])
+            if found["status"] in ("ready", "failed"):
+                break
+            time.sleep(0.2)
+        self.assertEqual(found["status"], "ready")  # its pipeline job ran on this workspace's worker
+        self.assertNotIn(draft["id"], {d["id"] for d in self.clients["owner1"].get("/api/drafts").json()})
+
+    # ------------------------------------------------------------------ sessions, tokens, members
+    def test_signed_out_requests_are_refused_and_sessions_end(self):
+        anonymous = self.TestClient(self.app)
+        self.assertEqual(anonymous.get("/api/projects").status_code, 401)
+        token = anonymous.get("/api/config").json()["csrf"]
+        self.assertEqual(anonymous.post("/api/projects", json={"name": "x"}, headers={"X-DCLab-Token": token}).status_code, 401)
+        self.assertEqual(anonymous.post("/api/auth/password", json={"email": self.users["ds1"]["email"], "password": "wrong password!"},
+                                        headers={"X-DCLab-Token": token}).status_code, 401)
+        client = self.sign_in("ds1")
+        self.assertTrue(client.get("/api/auth/me").json()["signed_in"])
+        self.assertEqual(client.post("/api/projects", json={"name": "x"}, headers={"X-DCLab-Token": "not the session's"}).status_code, 403)
+        client.post("/api/auth/signout")
+        self.assertEqual(client.get("/api/projects").status_code, 401)
+
+    def test_an_api_token_acts_as_its_user_without_a_cookie(self):
+        bare = self.TestClient(self.app)
+        token, record = self.accounts.create_token(self.users["ds1"]["id"], self.w1, "script")
+        headers = {"Authorization": f"Bearer {token}"}
+        self.assertEqual(bare.get("/api/projects", headers=headers).status_code, 200)
+        created = bare.post("/api/projects", json={"name": "From a script", "goal": "g"}, headers=headers)  # no CSRF: not a cookie
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(bare.post(f"/api/projects/{self.project['id']}/approvals", json={"gate": "holdout"}, headers=headers).status_code, 403)
+        self.accounts.revoke_token(self.users["ds1"]["id"], record["id"])
+        self.assertEqual(bare.get("/api/projects", headers=headers).status_code, 401)
+
+    def test_mcp_acts_in_the_tokens_workspace(self):
+        try:
+            import mcp  # noqa: F401
+        except ImportError:
+            self.skipTest("mcp not installed")
+        token, _ = self.accounts.create_token(self.users["ds2"]["id"], self.w2, "chat ui")
+        headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+        bare = self.TestClient(self.app)
+        call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "create_project", "arguments": {"name": "via mcp in W2", "goal": "g"}}}
+        self.assertEqual(bare.post("/mcp", json=call, headers=headers).status_code, 401)  # an MCP client sends a token
+        made = bare.post("/mcp", json=call, headers={**headers, "Authorization": f"Bearer {token}"})
+        self.assertEqual(made.status_code, 200, made.text[:300])
+        project_id = json.loads(made.json()["result"]["content"][0]["text"])["project_id"]
+        self.assertEqual(self.clients["ds2"].get(f"/api/projects/{project_id}").status_code, 200)  # in the token's workspace
+        self.assertEqual(self.clients["owner1"].get(f"/api/projects/{project_id}").status_code, 404)  # and not in the server's own
+        viewer, _ = self.accounts.create_token(self.users["view1"]["id"], self.w1, "viewer's")
+        self.assertEqual(bare.post("/mcp", json=call, headers={**headers, "Authorization": f"Bearer {viewer}"}).status_code, 403)
+
+    def test_the_owner_manages_members_and_a_workspace_keeps_an_owner(self):
+        owner, scientist = self.clients["owner1"], self.clients["ds1"]
+        self.assertEqual(scientist.post("/api/workspace/members", json={"email": "new@example.com", "role": "viewer"}).status_code, 403)
+        added = owner.post("/api/workspace/members", json={"email": f"new-{os.getpid()}@example.com", "role": "viewer", "password": PASSWORD})
+        self.assertEqual(added.status_code, 201, added.text)
+        self.assertEqual(owner.patch(f"/api/workspace/members/{added.json()['id']}", json={"role": "reviewer"}).json()["role_label"], "Reviewer")
+        self.assertEqual(owner.patch(f"/api/workspace/members/{self.users['owner1']['id']}", json={"role": "viewer"}).status_code, 409)
+        self.assertEqual(owner.delete(f"/api/workspace/members/{added.json()['id']}").status_code, 204)
+        labels = {m["role_label"] for m in owner.get("/api/workspace/members").json()}
+        self.assertTrue(labels <= {"Owner", "ML engineer", "Reviewer", "Business viewer"})  # the Admin page's names
+
+    def test_a_friend_added_with_their_own_workspace_never_sees_the_owners_projects(self):
+        owner = self.clients["owner1"]
+        email = f"friend-{os.getpid()}@example.com"
+        added = owner.post("/api/workspace/members", json={"email": email, "name": "Ali", "role": "viewer", "password": PASSWORD, "own_workspace": True})
+        self.assertEqual(added.status_code, 201, added.text)
+        body = added.json()
+        self.assertEqual((body["role"], body["workspace"]), ("owner", "Ali's lab"))
+        self.assertNotIn(body["id"], {m["id"] for m in owner.get("/api/workspace/members").json()})  # not in the owner's workspace
+        self.users["friend"] = self.accounts.by_email(email)
+        friend = self.sign_in("friend")
+        me = friend.get("/api/auth/me").json()
+        self.assertEqual([w["id"] for w in me["workspaces"]], [body["workspace_id"]])
+        self.assertEqual(friend.get("/api/projects").json(), [])  # an empty lab of their own
+        made = friend.post("/api/projects", json={"name": "Friend's churn", "goal": "g"}).json()["id"]
+        self.assertNotIn(made, {p["id"] for p in owner.get("/api/projects").json()})  # their projects stay apart
+        self.assertEqual(self.accounts.role_of(self.users["owner1"]["id"], body["workspace_id"]), "owner")  # the inviter can open it
+
+    def test_an_existing_account_is_never_placed_in_a_workspace_of_its_own_by_someone_else(self):
+        owner = self.clients["owner1"]
+        victim = self.accounts.create_user(f"existing-{os.getpid()}@example.com", "Existing", password=PASSWORD)
+        before = {w["id"] for w in self.accounts.workspaces_of(victim["id"])} if hasattr(self.accounts, "workspaces_of") else None
+        refused = owner.post("/api/workspace/members", json={"email": victim["email"], "name": "AAA", "role": "viewer", "own_workspace": True})
+        self.assertEqual(refused.status_code, 409, refused.text)
+        if before is not None:
+            self.assertEqual({w["id"] for w in self.accounts.workspaces_of(victim["id"])}, before)  # no lab was made around them
+
+    def test_a_username_signs_a_person_in_and_the_email_is_optional(self):
+        from dclabai.accounts.store import AccountError
+
+        handle = f"handle-{os.getpid()}"
+        user = self.accounts.create_user(None, "Handle Person", password=PASSWORD, username=handle.upper())  # no email: a username alone
+        self.assertEqual((user["username"], user["email"]), (handle, None))  # kept lower-case
+        self.accounts.set_member(self.w1, user["id"], "viewer")
+        self.assertEqual(self.accounts.check_password(handle.title(), PASSWORD)["id"], user["id"])  # by username, in any case
+        self.assertIsNone(self.accounts.check_password(handle, "not the password"))
+        with self.assertRaises(AccountError):
+            self.accounts.create_user(None, "Same", password=PASSWORD, username=handle)  # a username is unique
+        for bad in ("ab", "has space", "-leading", "x" * 40):
+            with self.assertRaises(AccountError):
+                self.accounts.create_user(None, "Bad", password=PASSWORD, username=bad)
+        with self.assertRaises(AccountError):
+            self.accounts.create_user(None, "Neither", password=PASSWORD)  # one of the two is needed
+        signed = self.TestClient(self.app)
+        csrf = signed.get("/api/config").json()["csrf"]
+        ok = signed.post("/api/auth/password", json={"login": handle, "password": PASSWORD}, headers={"X-DCLab-Token": csrf})
+        self.assertEqual(ok.status_code, 200, ok.text)  # the page's one field: a username
+        me = signed.get("/api/auth/me").json()
+        self.assertEqual((me["username"], me["email"]), (handle, ""))
+        stranger = self.TestClient(self.app)  # a fresh browser: no session yet
+        bad = stranger.post("/api/auth/password", json={"login": handle, "password": "wrong"}, headers={"X-DCLab-Token": stranger.get("/api/config").json()["csrf"]})
+        self.assertEqual(bad.status_code, 401)
+        from dclabai.accounts.__main__ import main as accounts_cli
+
+        with mock.patch.dict(os.environ, {"DCLAB_NEW_PASSWORD": "a-brand-new-pass-77"}):
+            self.assertEqual(accounts_cli(["passwd", "--username", handle]), 0)  # the command that changes a password
+            self.assertEqual(accounts_cli(["passwd", "--username", "nobody-here"]), 2)
+        self.assertIsNone(self.accounts.check_password(handle, PASSWORD))
+        self.assertTrue(self.accounts.check_password(handle, "a-brand-new-pass-77"))
+        mail = self.accounts.by_email(self.users["view1"]["email"])
+        self.assertEqual(self.accounts.check_password(self.users["view1"]["email"], PASSWORD)["id"], mail["id"])  # an email still signs in
+
+    def test_a_member_of_two_workspaces_switches_between_them(self):
+        user = self.accounts.create_user(f"both-{os.getpid()}@example.com", "Both", password=PASSWORD)
+        self.accounts.set_member(self.w1, user["id"], "viewer")
+        self.accounts.set_member(self.w2, user["id"], "owner")
+        self.users["both"] = user
+        client = self.sign_in("both")
+        me = client.get("/api/auth/me").json()
+        self.assertEqual({w["id"] for w in me["workspaces"]}, {self.w1, self.w2})
+        target = self.w2 if me["workspace_id"] == self.w1 else self.w1
+        self.assertEqual(client.post("/api/auth/workspace", json={"workspace_id": target}).status_code, 200)
+        self.assertEqual(client.get("/api/auth/me").json()["workspace_id"], target)
+        self.assertEqual(client.post("/api/auth/workspace", json={"workspace_id": "wnotmine"}).status_code, 404)
+
+
+    def test_sign_in_sessions_tokens_switches_and_roles_are_in_the_record(self):
+        """23.3: every sign-in and session change is in the workspace's record, with no token, password or raw address."""
+        import sqlalchemy as sa
+
+        from dclabai.storage.models import user_session
+
+        w1 = self.app.state.services.experience
+        client = self.sign_in("ds1")
+        events = [e for e in w1.read(user=self.users["ds1"]["id"]) if e.kind.startswith("auth.")]
+        signed = max((e for e in events if e.kind == "auth.sign_in"), key=lambda e: e.at)  # this test's sign-in, not setUpClass's
+        self.assertEqual(signed.payload["via"], "password")
+        self.assertEqual(len(signed.payload["agent"]), 16)
+        self.assertTrue("net" not in signed.payload or signed.payload["net"].endswith((".x", "::")))  # the test client has no address
+        self.assertTrue(signed.payload["session"])
+        from dclabai.accounts import api as auth_api
+
+        anonymous = self.TestClient(self.app)
+        csrf = anonymous.get("/api/config").json()["csrf"]
+        auth_api._FAILURES_SEEN.clear()
+        for _ in range(3):  # a flood of wrong passwords is one event a minute per address and browser
+            anonymous.post("/api/auth/password", json={"email": self.users["ds1"]["email"], "password": "wrong password!"}, headers={"X-DCLab-Token": csrf})
+        failed = [e for e in w1.read() if e.kind == "auth.sign_in_failed"]
+        self.assertEqual(failed[-1].payload["reason"], "bad_credentials")
+        self.assertIsNone(failed[-1].ids.user)
+        self.assertEqual(len([e for e in failed if e.at >= signed.at]), 1)
+        # a signed-out page may not write browser events, and the refusal writes nothing
+        before = len([e for e in w1.read() if e.kind.startswith("ui.")])
+        self.assertEqual(anonymous.post("/api/experience/ui", json={"events": [{"kind": "ui.page_viewed", "view": "home"}]}, headers={"X-DCLab-Token": csrf}).status_code, 401)
+        self.assertEqual(len([e for e in w1.read() if e.kind.startswith("ui.")]), before)
+        made = client.post("/api/auth/tokens", json={"name": "my laptop"}).json()
+        client.delete(f"/api/auth/tokens/{made['id']}")
+        tokens = [e for e in w1.read(user=self.users["ds1"]["id"]) if e.kind in ("auth.token_created", "auth.token_revoked")]
+        self.assertEqual([(e.kind, e.payload["token"]) for e in tokens[-2:]], [("auth.token_created", made["id"]), ("auth.token_revoked", made["id"])])
+        self.assertEqual(tokens[-2].payload["name"], "my laptop")
+        again_cookie = client.cookies.get("dclab_session")
+        self.assertTrue(again_cookie)
+        client.post("/api/auth/signout")
+        out = [e for e in w1.read(user=self.users["ds1"]["id"]) if e.kind == "auth.sign_out"]
+        self.assertEqual(out[-1].payload["session"], signed.payload["session"])
+        blob = " ".join(str(e.payload) for e in w1.read() if e.kind.startswith("auth."))
+        self.assertNotIn(PASSWORD, blob)
+        self.assertNotIn(made["token"], blob)  # the API token itself, shown once
+        self.assertNotIn(again_cookie, blob)
+        self.assertNotIn("Mozilla", blob)
+        self.assertNotIn("127.0.0.1", blob)
+        self.assertNotIn("testclient", blob)
+        # the owner changes a member's role: recorded as the owner's; a session that expires is said once
+        self.clients["owner1"].patch(f"/api/workspace/members/{self.users['view1']['id']}", json={"role": "reviewer"})
+        roles = [e for e in w1.read() if e.kind == "auth.role_changed"]
+        self.assertEqual((roles[-1].payload["member"], roles[-1].payload["role"], roles[-1].payload["by"]), (self.users["view1"]["id"], "reviewer", "owner"))
+        self.clients["owner1"].patch(f"/api/workspace/members/{self.users['view1']['id']}", json={"role": "viewer"})
+        again = self.sign_in("ds1")
+        session = max((e for e in w1.read(user=self.users["ds1"]["id"]) if e.kind == "auth.sign_in"), key=lambda e: e.at).payload["session"]
+        with self.accounts.engine.begin() as c:
+            c.execute(sa.update(user_session).where(user_session.c.id == session).values(expires=0))
+        self.assertEqual(again.get("/api/auth/me").json()["signed_in"], False)
+        again.get("/api/auth/me")
+        expired = [e for e in w1.read() if e.kind == "auth.session_expired" and e.payload.get("session") == session]
+        self.assertEqual(len(expired), 1)
+
+
+class PoolTests(unittest.TestCase):
+    def test_a_database_away_or_a_broken_workspace_stops_nothing(self):
+        from types import SimpleNamespace
+
+        from dclabai.agentic.pool import Pool
+
+        started = []
+        fake = SimpleNamespace(default=SimpleNamespace(worker=SimpleNamespace(start=lambda: started.append("own"))),
+                               settings=SimpleNamespace(auth="password"))
+        fake.workspace_ids = mock.Mock(side_effect=OSError("the database is away"))
+        Pool.start_all(fake)  # reported, not raised: the worker process and the server go on
+        fake.workspace_ids = lambda: ["own", "w-broken", "w-good"]
+        fake.get = lambda w: started.append(w) if w != "w-broken" else (_ for _ in ()).throw(RuntimeError("folder names another workspace"))
+        Pool.start_all(fake)
+        self.assertEqual(started, ["own", "own", "w-good"])  # the workspace after the broken one still starts
+
+    def test_a_route_with_several_methods_needs_what_each_needs(self):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from dclabai.accounts.guard import require
+        from dclabai.accounts.principal import Principal, acting
+
+        check = require("approve_gate", "write")
+        with acting(Principal(role="reviewer", user_id="u1")), self.assertRaises(HTTPException):
+            asyncio.run(check())  # a reviewer approves gates, but may not write
+        with acting(Principal(role="owner", user_id="u1")):
+            asyncio.run(check())
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_the_first_owner_is_added_from_the_command_line(self):
+        from dclabai.accounts.__main__ import main
+        from dclabai.accounts.store import Accounts
+
+        url = pgtest.require()
+        email = f"cli-{os.getpid()}-{int(time.time())}@example.com"
+        with mock.patch.dict(os.environ, {"DCLAB_DATABASE_URL": url, "DCLAB_NEW_PASSWORD": PASSWORD, "DCLAB_AGENT_HOME": tempfile.mkdtemp()}):
+            from dclabai.storage import db
+
+            db.upgrade(url)
+            self.assertEqual(main(["add", "--email", email, "--role", "owner", "--name", "First"]), 0)
+            self.assertIsNotNone(Accounts().check_password(email, PASSWORD))
+            self.assertIsNone(Accounts().check_password(email, "another long password"))
+
+
+if __name__ == "__main__":
+    unittest.main()

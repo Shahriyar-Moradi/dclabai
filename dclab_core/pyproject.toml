@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dclab-core"
+version = "0.100.0"
+description = "How DCLab understands a problem, analyses its data for decisions and plans a solution: a pure library."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pydantic>=2.10",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+# the PDF renderer of dclab_core.report (imported only when a PDF is asked for); Markdown and HTML need nothing more
+pdf = ["reportlab>=4.0"]
+# the columnar writer of dclab_core.columnar (the sets as Parquet beside the JSONL)
+parquet = ["pyarrow>=14.0"]
+
+# The package is this folder itself, so it can live at the R&D repository's root (imported without installation) and
+# still be built as a wheel: pip install "dclab-core @ git+https://...#subdirectory=dclab_core"
+[tool.setuptools]
+package-dir = {"dclab_core" = "."}
+packages = ["dclab_core", "dclab_core.replicas", "dclab_core.agents", "dclab_core.prompts", "dclab_core.adapters"]
+
+[tool.setuptools.package-data]
+dclab_core = ["schemas/*.json", "schemas/baseline/*.json", "README.md", "CHANGELOG.md"]
+"dclab_core.prompts" = ["*.md", "HASHES.json"]
+"dclab_core.adapters" = ["main_product_fields.json"]

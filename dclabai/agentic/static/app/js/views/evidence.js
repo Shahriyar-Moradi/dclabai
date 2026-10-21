@@ -1,0 +1,141 @@
+DC.view('evidence', {
+  init(el) {
+    const { $, $$, esc, chip, chips, RECORDS, TYPE_LABEL, TYPE_CLS, charts } = DC;
+    el.innerHTML = el.innerHTML.replace(/\$\{chip:([A-Za-z0-9_-]+)\}/g, (m, id) => chip(id));
+    const types = ['rule', 'workflow', 'experiment', 'leakage_precedent', 'pitfall', 'finding', 'dataset'];
+    const tok = s => (s.toLowerCase().match(/[a-z0-9_]+/g) || []).filter(w => w.length > 1 && !['the', 'is', 'of', 'to', 'and', 'in', 'on', 'for', 'a', 'it', 'be', 'do', 'should', 'with', 'what', 'my', 'are', 'when', 'fine'].includes(w));
+    let docs = [], df = {}, showAll = false;
+    const idf = w => Math.log(1 + docs.length / (1 + (df[w] || 0)));
+    const n = t => RECORDS.filter(r => r.type === t).length;
+    function search() {
+      const q = tok($('#ev-q', el).value), ds = $('#ev-ds', el).value;
+      const on = $$('#ev-types [aria-pressed="true"]', el).map(b => b.dataset.type);
+      const cand = docs.filter(d => (!on.length || on.includes(d.r.type)) && (!ds || (d.r.meta && d.r.meta.dataset === ds)));
+      const scored = cand.map(d => { let s = 0; q.forEach(w => { const c = d.text.split(w).length - 1; if (c) s += idf(w) * (Math.min(c, 5) + (d.title.includes(w) ? 3 : 0)); }); return { d, s }; })
+        .filter(x => !q.length || x.s > 0).sort((a, b) => b.s - a.s).slice(0, showAll ? 40 : 12);
+      $('#ev-results', el).innerHTML = scored.length ? scored.map(({ d }) => {
+        const text = d.r.text; const low = text.toLowerCase();
+        let at = q.map(w => low.indexOf(w)).filter(i => i >= 0).sort((a, b) => a - b)[0] || 0;
+        const start = Math.max(0, at - 90), snip = (start ? '…' : '') + text.slice(start, start + 260) + (start + 260 < text.length ? '…' : '');
+        let html = esc(snip);
+        q.forEach(w => { html = html.replace(new RegExp('(' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi'), '<mark>$1</mark>'); });
+        return `<button type="button" class="list-item" data-record="${esc(d.r.id)}"><div class="li-main"><span class="row"><span class="pill ${TYPE_CLS[d.r.type] || ''}">${esc(TYPE_LABEL[d.r.type] || d.r.type)}</span><span class="tag">${esc(d.r.id)}</span>${d.r.meta && d.r.meta.dataset ? `<span class="tag">${esc(d.r.meta.dataset)}</span>` : ''}</span><span class="li-title">${esc(d.r.title)}</span><span class="li-sub">${html}</span></div></button>`;
+      }).join('') + (!showAll && scored.length === 12 ? '<div class="list-item"><button type="button" class="link-btn small" id="ev-more">Show more results</button></div>' : '') : '<div class="empty">No record matches. Try fewer words, or clear the filters.</div>';
+    }
+    $('#ev-q', el).addEventListener('input', () => { showAll = false; search(); });
+    $('#ev-results', el).addEventListener('click', e => { if (e.target.closest('#ev-more')) { showAll = true; search(); } });
+    $('#ev-ds', el).addEventListener('change', search);
+    $('#ev-types', el).addEventListener('togglechange', search);
+    const WFR = { 'WF-01': ['DCLAB-R01', 'DCLAB-R18'], 'WF-02': ['DCLAB-R09', 'DCLAB-R21'], 'WF-03': ['DCLAB-R02', 'DCLAB-R17'], 'WF-04': ['DCLAB-R03', 'DCLAB-R12'], 'WF-05': ['DCLAB-R04', 'DCLAB-R05', 'DCLAB-R06'], 'WF-06': ['DCLAB-R07', 'DCLAB-R08', 'DCLAB-R10', 'DCLAB-R11'], 'WF-07': ['DCLAB-R13', 'DCLAB-R14'], 'WF-08': ['DCLAB-R15', 'DCLAB-R16'], 'WF-09': ['DCLAB-R17', 'DCLAB-R19', 'DCLAB-R22'], 'WF-10': ['DCLAB-R20', 'DCLAB-R21'] };
+    /* Everything below reads RECORDS, which DC.loadRecords() replaces with the live index (GET /api/evidence). */
+    this.render = () => {
+      const pressed = $$('#ev-types [aria-pressed="true"]', el).map(b => b.dataset.type), dsNow = $('#ev-ds', el).value;
+      $('#ev-total', el).textContent = RECORDS.length + ' records';
+      $('#ev-s-total', el).textContent = RECORDS.length;
+      $('#ev-s-rules', el).textContent = n('rule');
+      $('#ev-s-exp', el).textContent = n('experiment');
+      $('#ev-s-leak', el).textContent = n('leakage_precedent');
+      $('#ev-s-leak-l', el).textContent = `leakage precedents · and ${n('pitfall')} measured pitfalls`;
+      $('#ev-rules-h', el).textContent = `The ${n('rule')} rules`;
+      const count = (pane, v) => { const t = $(`.ptab[data-ptab="${pane}"] .n`, el); if (t) t.textContent = v; const p = $(`.pane[data-pane="${pane}"]`, el); if (p) p.dataset.count = v; };
+      count('rules', n('rule')); count('datasets', n('dataset'));
+      $('#ev-types', el).innerHTML = types.map(t => `<button type="button" class="chip" data-toggle data-type="${t}" aria-pressed="${pressed.includes(t)}">${esc(TYPE_LABEL[t])} <span class="faint">${n(t)}</span></button>`).join('');
+      const datasets = [...new Set(RECORDS.map(r => r.meta && r.meta.dataset).filter(Boolean))].sort();
+      $('#ev-ds', el).innerHTML = '<option value="">All datasets</option>' + datasets.map(d => `<option${d === dsNow ? ' selected' : ''}>${esc(d)}</option>`).join('');
+      docs = RECORDS.map(r => ({ r, title: r.title.toLowerCase(), text: (r.title + ' ' + r.text).toLowerCase() }));
+      df = {};
+      docs.forEach(d => new Set(tok(d.text)).forEach(w => { df[w] = (df[w] || 0) + 1; }));
+      search();
+      const most = Math.max(10, ...types.map(n)), top = Math.ceil(most / 10) * 10;
+      const mix = types.concat(RECORDS.some(r => r.type === 'workspace_lesson') ? ['workspace_lesson'] : []);
+      $('#ev-mix', el).innerHTML = charts.barsH(mix.map(t => ({ label: TYPE_LABEL[t], value: n(t), valueText: String(n(t)), cls: t === 'leakage_precedent' ? 'bad' : t === 'rule' ? 'proof' : '' })),
+        { width: 320, labelW: 132, valW: 34, min: 0, max: top, rowH: 24, ticks: [0, top / 2, top], tickFmt: v => v, aria: 'Records by type' });
+      const cites = id => RECORDS.filter(r => r.id !== id && r.text.includes(id)).length;
+      $('#rules-table tbody', el).innerHTML = RECORDS.filter(r => r.type === 'rule').map(r => `<tr data-record="${esc(r.id)}"><td>${chip(r.id)}</td><td>${esc(r.title)}</td><td class="small">${esc(((r.meta && r.meta.category) || '').replace(/_/g, ' '))}</td><td class="num">${cites(r.id)}</td></tr>`).join('');
+      $('#wf-cards', el).innerHTML = RECORDS.filter(r => r.type === 'workflow').map(r => `<div class="panel"><div class="panel-head"><div class="panel-title"><span class="eyebrow">${esc(r.id)}</span><h3>${esc(r.title)}</h3></div>${chip(r.id)}</div><div class="panel-body small stack tight"><p>${esc(r.text.replace(/^Workflow block WF-\d+ — [^:]+: /, ''))}</p>${chips(WFR[r.id] || [])}</div></div>`).join('');
+      $('#ds-cards', el).innerHTML = RECORDS.filter(r => r.type === 'dataset').map(r => {
+        const name = r.id.replace('DATASET-', '');
+        const rel = RECORDS.filter(x => x.meta && x.meta.dataset === name && x.type !== 'dataset').map(x => x.id).slice(0, 6);
+        return `<div class="panel"><div class="panel-head"><div class="panel-title"><h3>${esc(r.title)}</h3><span class="sub">${esc((r.meta && r.meta.task_type) || '')}</span></div></div><div class="panel-body small stack tight"><p class="muted">${esc(r.text.split('Decision-time contract:')[0].replace(/^Dataset `[^`]+`: [^.]+\.\s*/, '').slice(0, 220))}</p>${r.text.includes('Decision-time contract:') ? `<p><b>Solution:</b> ${esc(r.text.split('Decision-time contract:')[1].split('Blocked')[0].trim().slice(0, 200))}</p>` : ''}<div class="ev-list">${chip(r.id)}${chips(rel)}</div></div></div>`;
+      }).join('');
+      DC.hydrate(el);
+    };
+    this.render();
+    /* Ask: the question goes to POST /api/evidence/ask; the server searches the index and keeps only checked sentences. */
+    $('#ask-chips', el).addEventListener('click', async e => {
+      const b = e.target.closest('[data-ask]'); if (!b) return;
+      $$('#ask-chips .chip', el).forEach(c => c.setAttribute('aria-pressed', String(c === b)));
+      const out = $('#ask-answer', el);
+      out.innerHTML = '<div class="inset muted small">Searching the evidence…</div>';
+      let a;
+      try { a = await DC.client.evidenceAsk({ body: { question: b.textContent.trim() } }); }
+      catch (err) { out.innerHTML = `<div class="inset small">${esc(err.message)}</div>`; return; }
+      if (b.getAttribute('aria-pressed') !== 'true') return;  // another question was asked meanwhile
+      const recs = a.records.slice(0, a.mode === 'model' ? 0 : 3).map(r => `<div class="list-item"><div class="li-main"><span class="row"><span class="pill ${TYPE_CLS[r.type] || ''}">${esc(TYPE_LABEL[r.type] || r.type)}</span>${chip(r.id)}</span><span class="li-title">${esc(r.title)}</span><span class="li-sub">${esc(r.snippet)}</span></div></div>`).join('');
+      const lead = a.mode === 'model' && a.covered ? `<p>${a.sentences.map(x => `${esc(x.text)} ${chips(x.cites)}`).join(' ')}</p>`
+        : a.covered === false ? `<p><b>${esc(a.note.split('. ')[0].replace(/\.$/, ''))}.</b>${a.note.includes('. ') ? ' ' + esc(a.note.split('. ').slice(1).join('. ')) : ''}</p>` : '';
+      const note = a.covered === false ? (recs ? '<p class="xs muted">The closest records, for reference:</p>' : '') : `<p class="xs muted">${esc(a.note)}</p>`;
+      out.innerHTML = `<div class="inset stack tight">${lead}${note}${recs ? `<div class="list small">${recs}</div>` : ''}</div>`;
+      DC.hydrate(out);
+    });
+    /* Workspace lessons (A5.3): proposed after a project's final stage, reviewed here, then searched with the records. */
+    const lessonsEl = $('#ev-lessons', el);
+    this.loadLessons = async () => {
+      let d;
+      try { d = await DC.client.listLessons(); } catch (err) { return; }
+      const all = (d && d.lessons) || [], waiting = all.filter(l => l.status === 'proposed').length;
+      $('#ev-lessons-panel', el).hidden = !all.length;
+      const pill = $('#ev-lessons-pill', el);
+      pill.textContent = all.length ? `${all.filter(l => l.status === 'accepted').length} accepted · ${waiting} to review` : 'no lessons yet';
+      pill.className = 'pill ' + (waiting ? 'warn' : all.length ? 'ok' : 'outline');
+      const cite = (l, id) => `<span class="tag" title="${esc((l.sources || {})[id] || id)}">${esc(id.replace(/^PRJ-[^-]+-/, ''))}</span>`;
+      lessonsEl.innerHTML = all.slice().reverse().map(l => {
+        const s = l.scope || {}, r = l.review || {};
+        const scope = [s.project && 'project ' + s.project, s.dataset, s.task, s.rows && s.rows + ' rows', s.metric && 'metric ' + s.metric].filter(Boolean).join(' · ');
+        const acts = l.status === 'rejected' || l.status === 'superseded' ? '' : (l.status === 'proposed' ? ['accept', 'edit', 'reject'] : ['reject'])
+          .map(a => `<button type="button" class="link-btn small" data-lesson="${esc(l.id)}" data-act="${a}">${a === 'reject' && l.status === 'accepted' ? 'Withdraw' : a[0].toUpperCase() + a.slice(1)}</button>`).join('');
+        return `<div class="list-item"><div class="li-main stack tight"><span class="row"><span class="pill ${l.status === 'accepted' ? 'ok' : l.status === 'rejected' ? 'bad' : 'outline'}" title="${l.status === 'superseded' ? 'The final stage ran again; review the latest run\'s lessons' : ''}">${esc(l.status)}</span>`
+          + (l.synthetic ? '<span class="pill warn">synthetic data: not evidence</span>' : '')
+          + `<span class="pill outline">${l.written_by === 'model' ? 'written by a model, checked' : 'written by code'}</span></span>`
+          + `<span class="li-title">${esc(l.claim)} ${(l.cites || []).map(id => cite(l, id)).join('')}</span>`
+          + `<span class="li-sub"><b>Scope:</b> ${esc(scope)}</span><span class="li-sub"><b>Against it:</b> ${esc(l.against)}</span><span class="li-sub"><b>Next test:</b> ${esc(l.next_test)}</span>`
+          + (r.by ? `<span class="xs muted">${esc(r.action)} by the ${esc(r.by)} · ${esc((r.at || '').slice(0, 10))}${r.reason ? ' · ' + esc(r.reason) : ''}</span>` : '')
+          + (acts ? `<span class="row">${acts}</span>` : '') + '</div></div>';
+      }).join('');
+      this.lessons = all;
+    };
+    lessonsEl.addEventListener('click', e => {
+      const b = e.target.closest('[data-lesson]'); if (!b) return;
+      const l = (this.lessons || []).find(x => x.id === b.dataset.lesson), act = b.dataset.act; if (!l) return;
+      const field = (k, label) => `<label class="small" for="lesson-${k}">${label}</label><textarea id="lesson-${k}" rows="2">${esc(l[k])}</textarea>`;
+      DC.modal.open({
+        eyebrow: '<span class="eyebrow">Workspace lesson</span>',
+        title: act === 'accept' ? 'Accept this lesson?' : act === 'edit' ? 'Edit and accept' : l.status === 'accepted' ? 'Withdraw this lesson?' : 'Reject this lesson?',
+        confirm: act === 'accept' ? 'Accept' : act === 'edit' ? 'Save and accept' : act === 'reject' && l.status === 'accepted' ? 'Withdraw' : 'Reject',
+        html: (act === 'edit' ? field('claim', 'Claim') + field('against', 'Against it') + field('next_test', 'Next test') : `<p>${esc(l.claim)}</p>`)
+          + '<label class="small" for="lesson-reason">Reason</label><textarea id="lesson-reason" rows="2" placeholder="Why"></textarea>'
+          + '<label class="row small"><input type="checkbox" id="lesson-role"> I review this as the workspace\'s reviewer</label>'
+          + '<p class="xs muted">Until accounts exist, the role is the one you declare here; the project log records it.</p>',
+        onConfirm: () => {
+          const v = id => (document.getElementById(id) || {}).value || '';
+          if (!(document.getElementById('lesson-role') || {}).checked) { DC.toast('Only a reviewer reviews a lesson: tick the box.', { ok: false }); return false; }
+          const body = { action: act, reason: v('lesson-reason') };
+          if (act === 'edit') Object.assign(body, { claim: v('lesson-claim'), against: v('lesson-against'), next_test: v('lesson-next_test') });
+          DC.client.reviewLesson(l.id, { headers: { 'X-DCLab-Role': 'reviewer' }, body })
+            .then(() => { DC.modal.close(); DC.toast(act === 'reject' ? 'Lesson kept out of the evidence.' : l.synthetic ? 'Lesson accepted. It came from synthetic data, so it is never offered as evidence.' : 'Lesson accepted: it is searched with the records.'); this.loadLessons(); DC.loadRecords(true).then(() => this.render && this.render()); })
+            .catch(err => DC.toast(err.message, { ok: false }));
+          return false;
+        },
+      });
+    });
+    DC.hydrate(el);
+  },
+  async enter() {
+    DC.markSample(false);
+    const live = await DC.loadRecords();
+    if (this.render) this.render();
+    if (this.loadLessons) this.loadLessons();
+    const pill = DC.$('#ev-guide-pill');
+    if (live && pill) { pill.textContent = live.guide ? 'exists' : 'not built here'; pill.className = 'pill ' + (live.guide ? 'ok' : 'outline'); }
+  },
+});
