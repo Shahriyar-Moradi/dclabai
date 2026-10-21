@@ -303,6 +303,10 @@ class ProblemAnalystTests(unittest.TestCase):  # step 1 of connecting understand
         t = orch.Turn(chat.services, "p1", chat.draft, chat.agent, "x")
         self.assertIn("error", orch.confirm_problem_change(t))  # never confirmed without the person having been asked (the review)
         t.offered = {"tool": "confirm_problem_change", "args": {"change": chat.store.get(chat.draft)["problem_change"]["id"]}}
+        self.assertIn("did not say yes", orch.confirm_problem_change(t)["error"])  # asked is not agreed (Claude, live, 2026-10-21)
+        t.text = "build a new version with 5 folds"
+        self.assertIn("did not say yes", orch.confirm_problem_change(t)["error"])
+        t.text = "yes, use churned_60d"
         self.assertIn("confirmed", orch.confirm_problem_change(t, change="outcome: churned -> churned_60d"))  # named in words: still the pending one
         new = chat.since("we should predict churn within 60 days instead")
         self.assertEqual(chat.store.get(chat.draft)["problem_change"]["problem"]["outcome"], "churned_60d")  # on top of the confirmed version
@@ -568,6 +572,15 @@ class ModelTests(unittest.TestCase):
         with mock.patch.object(orch, "_model_serves", return_value=False):
             new = chat.since("show the models")
         self.assertEqual(new[-1]["path"], "rules")
+
+    def test_a_model_that_only_talks_where_the_rules_would_act_leaves_the_turn_to_the_rules(self):  # qwen2.5:1.5b on Ollama, 2026-10-21
+        said = ("For the project's next version, 5-fold cross-validation is proposed. The stage runs have been completed. "
+                "Now, a new version is awaiting a confirmation.")  # nothing was planned: a claim no tool backs
+        chat = Chat(self, gateway([answer(said)]))
+        new = chat.since("show me the models")
+        self.assertEqual(new[-1]["path"], "rules")
+        self.assertTrue(any(m["kind"] == "project_card" for m in new))
+        self.assertNotIn("awaiting a confirmation", json.dumps([m.get("text") for m in new]))
 
     def test_a_tool_call_written_as_text_or_an_empty_reply_leaves_the_turn_to_the_rules(self):  # qwen2.5-coder:1.5b on Ollama, 2026-10-21
         for said in ('To do that, call the `solve` function:\n\n```json\n{\n  "name": "solve",\n}\n```',
